@@ -1,0 +1,6 @@
+@echo off
+echo Pulling latest code from GitHub...
+git pull
+echo.
+echo Restarting dashboard...
+py -m streamlit run dashboard.py

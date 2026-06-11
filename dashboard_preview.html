@@ -1,0 +1,964 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>BankFlow | Ventures &amp; Stores</title>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+<style>
+/* ── Reset ── */
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+html, body { height: 100%; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Arial, sans-serif; background: #EEF2EE; color: #111827; font-size: 14px; }
+
+/* ── Layout ── */
+.app { display: flex; height: 100vh; overflow: hidden; }
+.sidebar { width: 268px; min-width: 268px; background: #fff; border-right: 1px solid #E5E7EB; display: flex; flex-direction: column; overflow-y: auto; padding: 0 0 24px 0; }
+.main { flex: 1; overflow-y: auto; padding: 24px 28px; display: flex; flex-direction: column; gap: 20px; }
+
+/* ── Sidebar ── */
+.sb-brand { padding: 20px 20px 16px; border-bottom: 1px solid #F3F4F6; }
+.sb-brand h2 { font-size: 18px; font-weight: 800; color: #111827; display: flex; align-items: center; gap: 8px; }
+.sb-brand span.icon { font-size: 22px; }
+.sb-brand p { font-size: 11px; color: #9CA3AF; margin-top: 2px; letter-spacing: 0.5px; }
+.sb-section { padding: 16px 20px; border-bottom: 1px solid #F3F4F6; }
+.sb-section label { font-size: 11px; font-weight: 700; color: #6B7280; letter-spacing: 1px; text-transform: uppercase; display: block; margin-bottom: 6px; }
+.sb-select, .sb-input { width: 100%; padding: 7px 10px; border: 1px solid #E5E7EB; border-radius: 8px; font-size: 13px; color: #111827; background: #F9FAFB; outline: none; cursor: pointer; }
+.sb-select:focus, .sb-input:focus { border-color: #22C55E; background: #fff; }
+.sb-row { display: flex; gap: 8px; }
+.sb-row .sb-group { flex: 1; }
+.sb-btn { width: 100%; padding: 8px 12px; border: none; border-radius: 8px; font-size: 13px; font-weight: 600; cursor: pointer; margin-top: 8px; display: flex; align-items: center; justify-content: center; gap: 6px; transition: all 0.15s; }
+.sb-btn-primary { background: #111827; color: #fff; }
+.sb-btn-primary:hover { background: #1F2937; }
+.sb-btn-secondary { background: #F3F4F6; color: #374151; border: 1px solid #E5E7EB; }
+.sb-btn-secondary:hover { background: #E5E7EB; }
+.sb-stats { padding: 16px 20px; }
+.sb-stat { display: flex; justify-content: space-between; align-items: center; padding: 5px 0; border-bottom: 1px solid #F9FAFB; }
+.sb-stat:last-child { border-bottom: none; }
+.sb-stat span:first-child { font-size: 11px; color: #9CA3AF; }
+.sb-stat span:last-child { font-size: 12px; font-weight: 700; color: #111827; }
+.sb-badge { display: inline-flex; align-items: center; padding: 2px 8px; border-radius: 99px; font-size: 11px; font-weight: 600; }
+.badge-green { background: #DCFCE7; color: #15803D; }
+.badge-red { background: #FEE2E2; color: #DC2626; }
+.badge-amber { background: #FEF3C7; color: #D97706; }
+.badge-blue { background: #DBEAFE; color: #1D4ED8; }
+.badge-gray { background: #F3F4F6; color: #6B7280; }
+
+/* ── KPI Strip ── */
+.kpi-strip { display: grid; grid-template-columns: repeat(4, 1fr); gap: 14px; }
+.kpi-card { background: #fff; border-radius: 12px; padding: 16px 20px; box-shadow: 0 1px 3px rgba(0,0,0,0.07); border: 1px solid #F3F4F6; }
+.kpi-card.hero { background: #111827; border-color: #111827; }
+.kpi-label { font-size: 11px; font-weight: 700; letter-spacing: 1px; text-transform: uppercase; color: #9CA3AF; margin-bottom: 6px; }
+.kpi-card.hero .kpi-label { color: #6B7280; }
+.kpi-val { font-size: 22px; font-weight: 800; color: #111827; font-variant-numeric: tabular-nums; }
+.kpi-card.hero .kpi-val { color: #F9FAFB; }
+.kpi-val.green { color: #15803D; }
+.kpi-val.red { color: #DC2626; }
+.kpi-sub { font-size: 11px; color: #9CA3AF; margin-top: 3px; }
+
+/* ── Tab Nav ── */
+.tab-nav { display: flex; gap: 4px; background: #fff; border-radius: 12px; padding: 6px; box-shadow: 0 1px 3px rgba(0,0,0,0.06); border: 1px solid #F3F4F6; width: fit-content; }
+.tab-btn { padding: 8px 18px; border: none; background: transparent; border-radius: 8px; font-size: 13px; font-weight: 600; color: #6B7280; cursor: pointer; transition: all 0.15s; white-space: nowrap; }
+.tab-btn:hover { color: #111827; background: #F9FAFB; }
+.tab-btn.active { background: #111827; color: #fff; }
+
+/* ── Tab Content ── */
+.tab-panel { display: none; }
+.tab-panel.active { display: block; }
+
+/* ── Cards ── */
+.card { background: #fff; border-radius: 12px; padding: 20px; box-shadow: 0 1px 3px rgba(0,0,0,0.07); border: 1px solid #F3F4F6; }
+.card-title { font-size: 13px; font-weight: 700; color: #374151; margin-bottom: 16px; display: flex; align-items: center; gap: 8px; }
+.card-title .dot { width: 8px; height: 8px; border-radius: 50%; }
+.dot-green { background: #22C55E; }
+.dot-blue { background: #3B82F6; }
+.dot-amber { background: #F59E0B; }
+.dot-red { background: #EF4444; }
+.grid-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+.grid-3 { display: grid; grid-template-columns: repeat(3, 1fr); gap: 14px; }
+.grid-1-2 { display: grid; grid-template-columns: 1fr 2fr; gap: 16px; }
+
+/* ── Entity Cards ── */
+.entity-card { background: #F9FAFB; border-radius: 10px; padding: 16px; border: 1px solid #F3F4F6; }
+.entity-name { font-size: 13px; font-weight: 700; color: #374151; margin-bottom: 10px; }
+.entity-row { display: flex; justify-content: space-between; margin-bottom: 5px; }
+.entity-row span:first-child { font-size: 11px; color: #9CA3AF; }
+.entity-row span:last-child { font-size: 12px; font-weight: 700; }
+
+/* ── Tables ── */
+.tbl-wrap { overflow-x: auto; }
+table { width: 100%; border-collapse: collapse; font-size: 13px; }
+thead th { padding: 9px 12px; font-size: 10px; font-weight: 700; text-transform: uppercase; letter-spacing: 1px; color: #9CA3AF; background: #F9FAFB; border-bottom: 2px solid #E5E7EB; text-align: left; white-space: nowrap; }
+thead th.r { text-align: right; }
+tbody tr { border-bottom: 1px solid #F9FAFB; transition: background 0.1s; }
+tbody tr:hover { background: #FAFAFA; }
+tbody td { padding: 8px 12px; color: #374151; }
+tbody td.r { text-align: right; font-family: 'Courier New', monospace; font-size: 12px; white-space: nowrap; }
+.mono { font-family: 'Courier New', monospace; font-size: 12px; }
+.txt-green { color: #15803D; font-weight: 600; }
+.txt-red { color: #DC2626; }
+.txt-muted { color: #D1D5DB; }
+.txt-gray { color: #9CA3AF; }
+
+/* ── Filters ── */
+.filter-bar { display: flex; gap: 10px; align-items: flex-end; margin-bottom: 16px; flex-wrap: wrap; }
+.filter-group { display: flex; flex-direction: column; gap: 4px; }
+.filter-group label { font-size: 11px; font-weight: 700; color: #6B7280; letter-spacing: 0.5px; text-transform: uppercase; }
+.filter-group select, .filter-group input { padding: 7px 10px; border: 1px solid #E5E7EB; border-radius: 8px; font-size: 13px; color: #111827; background: #F9FAFB; outline: none; min-width: 160px; }
+.btn-clear { padding: 7px 14px; background: #F3F4F6; border: 1px solid #E5E7EB; border-radius: 8px; font-size: 12px; font-weight: 600; color: #6B7280; cursor: pointer; align-self: flex-end; }
+.btn-clear:hover { background: #E5E7EB; }
+.btn-export { padding: 7px 14px; background: #111827; border: none; border-radius: 8px; font-size: 12px; font-weight: 600; color: #fff; cursor: pointer; align-self: flex-end; margin-left: auto; }
+.btn-reload { padding: 9px 20px; background: #22C55E; border: none; border-radius: 8px; font-size: 13px; font-weight: 700; color: #fff; cursor: pointer; display: flex; align-items: center; gap: 6px; }
+.btn-reload:hover { background: #16A34A; }
+
+/* ── Alert boxes ── */
+.alert { border-radius: 10px; padding: 12px 16px; margin-bottom: 14px; font-size: 13px; line-height: 1.5; }
+.alert-amber { background: #FFFBEB; border: 1px solid #FDE68A; color: #92400E; }
+.alert-red { background: #FEF2F2; border: 1px solid #FECACA; color: #991B1B; }
+.alert-green { background: #F0FDF4; border: 1px solid #BBF7D0; color: #166534; }
+.alert-blue { background: #EFF6FF; border: 1px solid #BFDBFE; color: #1E40AF; }
+.alert b { font-weight: 700; }
+
+/* ── Section header ── */
+.section-hdr { font-size: 12px; font-weight: 700; color: #6B7280; text-transform: uppercase; letter-spacing: 1.2px; margin-bottom: 12px; padding-bottom: 6px; border-bottom: 1px solid #F3F4F6; }
+
+/* ── Reconciliation strip ── */
+.recon { background: #F0FDF4; border: 1px solid #BBF7D0; border-radius: 10px; padding: 12px 16px; font-size: 12px; color: #166534; display: flex; gap: 12px; align-items: center; flex-wrap: wrap; margin-top: 12px; }
+.recon-eq { font-size: 18px; color: #22C55E; }
+.recon-val { font-weight: 700; font-family: 'Courier New', monospace; }
+
+/* ── Cash flow table ── */
+.cf-controls { display: flex; gap: 12px; align-items: flex-end; margin-bottom: 18px; flex-wrap: wrap; }
+.cf-toggle { display: flex; background: #F3F4F6; border-radius: 8px; padding: 3px; }
+.cf-toggle button { padding: 6px 16px; border: none; border-radius: 6px; font-size: 12px; font-weight: 600; cursor: pointer; background: transparent; color: #6B7280; transition: all 0.15s; }
+.cf-toggle button.active { background: #fff; color: #111827; box-shadow: 0 1px 3px rgba(0,0,0,0.12); }
+.cft { width: 100%; font-size: 13px; border-collapse: collapse; color: #2D3748; }
+.cft th { padding: 10px 14px; font-size: 10px; font-weight: 700; letter-spacing: 1.2px; text-transform: uppercase; color: #9CA3AF; background: #F1F3F5; border-bottom: 2px solid #4E8DF5; }
+.cft th.r { text-align: right; }
+.cft td { padding: 7px 14px; border-bottom: 1px solid #F3F4F6; }
+.cft td.r { text-align: right; white-space: nowrap; font-family: 'Courier New', monospace; font-size: 12px; }
+.cf-hdr td { font-weight: 700; font-size: 13px; color: #111827; background: #F1F3F5; padding: 9px 14px; border-top: 1px solid #E5E7EB; border-bottom: 1px solid #E5E7EB; }
+.cf-tot td { font-weight: 700; font-size: 13px; background: #E8F4FD; border-top: 2px solid #4E8DF5; border-bottom: 1px solid #DBEAFE; padding: 9px 14px; color: #1E3A5F; }
+.cf-net td { font-weight: 800; font-size: 15px; background: #F0FDF4; border-top: 2px solid #2E7D32; border-bottom: 2px solid #2E7D32; padding: 11px 14px; color: #2E7D32; }
+.cf-indent { padding-left: 30px !important; }
+.cf-green { color: #15803D; font-family: 'Courier New', monospace; font-size: 12px; }
+.cf-red { color: #DC2626; font-family: 'Courier New', monospace; font-size: 12px; }
+.cf-dash { color: #D1D5DB; font-family: 'Courier New', monospace; font-size: 12px; }
+
+/* ── Donut legend ── */
+.donut-wrap { display: flex; gap: 20px; align-items: flex-start; }
+.donut-chart-container { width: 200px; min-width: 200px; height: 200px; }
+.donut-legend { flex: 1; display: flex; flex-direction: column; gap: 6px; padding-top: 8px; }
+.legend-item { display: flex; align-items: center; gap: 8px; font-size: 12px; }
+.legend-dot { width: 10px; height: 10px; border-radius: 50%; flex-shrink: 0; }
+.legend-label { flex: 1; color: #374151; }
+.legend-val { font-family: 'Courier New', monospace; font-weight: 700; color: #111827; }
+
+/* ── Progress bar ── */
+.prog-bar { background: #F3F4F6; border-radius: 99px; height: 5px; margin-top: 4px; overflow: hidden; }
+.prog-fill { height: 100%; border-radius: 99px; background: #22C55E; }
+
+/* ── Missing statement row ── */
+.missing-row { display: flex; align-items: center; gap: 12px; padding: 10px 14px; background: #FEF2F2; border-radius: 8px; margin-bottom: 6px; font-size: 13px; }
+.missing-row .miss-entity { font-weight: 700; color: #111827; min-width: 80px; }
+.missing-row .miss-bank { font-family: 'Courier New', monospace; color: #374151; min-width: 100px; }
+.missing-row .miss-month { color: #6B7280; }
+.miss-badge { margin-left: auto; background: #FEE2E2; color: #991B1B; padding: 2px 10px; border-radius: 99px; font-size: 11px; font-weight: 700; }
+
+/* ── Page title ── */
+.page-title { font-size: 22px; font-weight: 800; color: #111827; margin-bottom: 4px; }
+.page-sub { font-size: 13px; color: #6B7280; }
+
+/* ── Scrollbar ── */
+::-webkit-scrollbar { width: 5px; height: 5px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: #D1D5DB; border-radius: 99px; }
+</style>
+</head>
+<body>
+<div class="app">
+
+<!-- ═══════════════════════════════════════════════════════ SIDEBAR -->
+<aside class="sidebar">
+  <div class="sb-brand">
+    <h2><span class="icon">🏦</span> BankFlow</h2>
+    <p>VENTURES &amp; STORES · FY 2024–25</p>
+  </div>
+
+  <div class="sb-section">
+    <label>Entity</label>
+    <select class="sb-select" id="sb-entity" onchange="applyFilters()">
+      <option value="All">All Entities</option>
+      <option value="Stores">Stores</option>
+      <option value="Ventures">Ventures</option>
+    </select>
+  </div>
+
+  <div class="sb-section">
+    <label>Bank Account</label>
+    <select class="sb-select" id="sb-bank" onchange="applyFilters()">
+      <option value="All">All Banks</option>
+      <optgroup label="Stores">
+        <option value="AXIS-8218">AXIS-8218</option>
+        <option value="AXIS-7647">AXIS-7647</option>
+      </optgroup>
+      <optgroup label="Ventures">
+        <option value="AXIS-5623">AXIS-5623</option>
+        <option value="HDFC-7862">HDFC-7862</option>
+      </optgroup>
+    </select>
+  </div>
+
+  <div class="sb-section">
+    <label>Date Range</label>
+    <div class="sb-row">
+      <div class="sb-group">
+        <label style="font-size:10px;color:#9CA3AF;">FROM</label>
+        <input type="date" class="sb-input" id="sb-from" value="2025-05-01">
+      </div>
+      <div class="sb-group">
+        <label style="font-size:10px;color:#9CA3AF;">TO</label>
+        <input type="date" class="sb-input" id="sb-to" value="2025-05-31">
+      </div>
+    </div>
+  </div>
+
+  <div class="sb-section">
+    <button class="sb-btn sb-btn-primary" onclick="alert('Scan triggered — processor.py would run here.')">
+      📂 Process New Files
+    </button>
+    <button class="sb-btn sb-btn-secondary" onclick="alert('Keywords reloaded — reload_categories() would run here.')">
+      🔄 Reload Keywords
+    </button>
+  </div>
+
+  <div class="sb-stats">
+    <div style="font-size:10px;font-weight:700;color:#9CA3AF;letter-spacing:1px;text-transform:uppercase;margin-bottom:10px;">Quick Stats</div>
+    <div class="sb-stat"><span>Total Transactions</span><span>14,382</span></div>
+    <div class="sb-stat"><span>Categorized</span><span class="sb-badge badge-green">10,235 (71%)</span></div>
+    <div class="sb-stat"><span>Uncategorized</span><span class="sb-badge badge-amber">4,147</span></div>
+    <div class="sb-stat"><span>Missing Statements</span><span class="sb-badge badge-red">1</span></div>
+    <div class="sb-stat"><span>Active Accounts</span><span>4</span></div>
+    <div class="sb-stat"><span>Last Import</span><span style="font-size:11px;color:#6B7280;">14 May 2025</span></div>
+  </div>
+</aside>
+
+<!-- ═══════════════════════════════════════════════════════ MAIN -->
+<main class="main">
+
+  <!-- KPI STRIP -->
+  <div class="kpi-strip">
+    <div class="kpi-card">
+      <div class="kpi-label">Total Inflow</div>
+      <div class="kpi-val green">₹2,44,37,850</div>
+      <div class="kpi-sub">All entities · All accounts</div>
+    </div>
+    <div class="kpi-card">
+      <div class="kpi-label">Total Outflow</div>
+      <div class="kpi-val red">₹1,98,42,130</div>
+      <div class="kpi-sub">Excl. inter-company transfers</div>
+    </div>
+    <div class="kpi-card">
+      <div class="kpi-label">Net Flow</div>
+      <div class="kpi-val green">₹45,95,720</div>
+      <div class="kpi-sub">Inflow minus outflow</div>
+    </div>
+    <div class="kpi-card hero">
+      <div class="kpi-label">Closing Balance</div>
+      <div class="kpi-val">₹80,03,450</div>
+      <div class="kpi-sub" style="color:#4B5563;">Across all 4 accounts</div>
+    </div>
+  </div>
+
+  <!-- TAB NAV -->
+  <div class="tab-nav">
+    <button class="tab-btn active" onclick="switchTab('overview', this)">📊 Overview</button>
+    <button class="tab-btn" onclick="switchTab('transactions', this)">📋 Transactions</button>
+    <button class="tab-btn" onclick="switchTab('review', this)">🔍 Review Queue</button>
+    <button class="tab-btn" onclick="switchTab('exceptions', this)">⚠️ Exceptions</button>
+    <button class="tab-btn" onclick="switchTab('cashflow', this)">💰 Cash Flow</button>
+  </div>
+
+  <!-- ─────────────────────────────── TAB: OVERVIEW -->
+  <div id="tab-overview" class="tab-panel active">
+
+    <!-- Entity Cards -->
+    <div class="grid-2" style="margin-bottom:16px;">
+      <div class="card">
+        <div class="card-title"><span class="dot dot-green"></span>Stores — Performance</div>
+        <div class="grid-2" style="gap:12px;">
+          <div class="entity-card">
+            <div class="entity-name">AXIS-8218 (Stores)</div>
+            <div class="entity-row"><span>Inflow</span><span class="txt-green mono">₹98,40,000</span></div>
+            <div class="entity-row"><span>Outflow</span><span class="txt-red mono">₹81,20,000</span></div>
+            <div class="entity-row"><span>Net</span><span class="mono" style="font-weight:700;">₹17,20,000</span></div>
+          </div>
+          <div class="entity-card">
+            <div class="entity-name">AXIS-7647 (Stores)</div>
+            <div class="entity-row"><span>Inflow</span><span class="txt-green mono">₹54,00,000</span></div>
+            <div class="entity-row"><span>Outflow</span><span class="txt-red mono">₹40,10,000</span></div>
+            <div class="entity-row"><span>Net</span><span class="mono" style="font-weight:700;">₹13,90,000</span></div>
+          </div>
+        </div>
+        <div style="margin-top:12px;padding-top:12px;border-top:1px solid #F3F4F6;display:flex;justify-content:space-between;font-size:12px;">
+          <span style="color:#6B7280;">Stores Total Inflow</span><span class="txt-green mono" style="font-weight:800;">₹1,52,40,000</span>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="card-title"><span class="dot dot-blue"></span>Ventures — Performance</div>
+        <div class="grid-2" style="gap:12px;">
+          <div class="entity-card">
+            <div class="entity-name">AXIS-5623 (Ventures)</div>
+            <div class="entity-row"><span>Inflow</span><span class="txt-green mono">₹58,20,000</span></div>
+            <div class="entity-row"><span>Outflow</span><span class="txt-red mono">₹46,80,000</span></div>
+            <div class="entity-row"><span>Net</span><span class="mono" style="font-weight:700;">₹11,40,000</span></div>
+          </div>
+          <div class="entity-card">
+            <div class="entity-name">HDFC-7862 (Ventures)</div>
+            <div class="entity-row"><span>Inflow</span><span class="txt-green mono">₹33,77,850</span></div>
+            <div class="entity-row"><span>Outflow</span><span class="txt-red mono">₹30,32,130</span></div>
+            <div class="entity-row"><span>Net</span><span class="mono" style="font-weight:700;">₹3,45,720</span></div>
+          </div>
+        </div>
+        <div style="margin-top:12px;padding-top:12px;border-top:1px solid #F3F4F6;display:flex;justify-content:space-between;font-size:12px;">
+          <span style="color:#6B7280;">Ventures Total Inflow</span><span class="txt-green mono" style="font-weight:800;">₹91,97,850</span>
+        </div>
+      </div>
+    </div>
+
+    <!-- Charts Row -->
+    <div class="grid-1-2" style="margin-bottom:16px;">
+      <div class="card">
+        <div class="card-title"><span class="dot dot-amber"></span>Expenditure by Category</div>
+        <div class="donut-wrap">
+          <div class="donut-chart-container">
+            <canvas id="donutChart"></canvas>
+          </div>
+          <div class="donut-legend" id="donut-legend"></div>
+        </div>
+      </div>
+      <div class="card">
+        <div class="card-title"><span class="dot dot-green"></span>Monthly Cash Flow Trend</div>
+        <canvas id="barChart" height="100"></canvas>
+      </div>
+    </div>
+
+    <!-- Category Detail Table -->
+    <div class="card">
+      <div class="card-title"><span class="dot dot-red"></span>Expense Category Breakdown</div>
+      <div class="tbl-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>Final Group</th>
+              <th>Main Group</th>
+              <th class="r">Total Outflow (₹)</th>
+              <th class="r">% of Total</th>
+              <th style="width:140px;">Share</th>
+            </tr>
+          </thead>
+          <tbody id="category-table-body"></tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+
+  <!-- ─────────────────────────────── TAB: TRANSACTIONS -->
+  <div id="tab-transactions" class="tab-panel">
+    <div class="filter-bar">
+      <div class="filter-group">
+        <label>Final Group</label>
+        <select id="fg-filter" onchange="filterTransactions()">
+          <option value="">All</option>
+          <option>RAZORPAY</option>
+          <option>CC-CMS</option>
+          <option>Sundry Creditors-Apparels</option>
+          <option>02-Employee Cost</option>
+          <option>01-Rent</option>
+          <option>Statuatory Payment</option>
+          <option>17-Bank Charges</option>
+          <option>Uncategorized</option>
+        </select>
+      </div>
+      <div class="filter-group">
+        <label>Main Group</label>
+        <select id="mg-filter" onchange="filterTransactions()">
+          <option value="">All</option>
+          <option>Receipt</option>
+          <option>Payment</option>
+          <option>INTERCOMPANY</option>
+          <option>OPENING BALANCE</option>
+        </select>
+      </div>
+      <div class="filter-group">
+        <label>Search Narration</label>
+        <input type="text" id="narr-search" placeholder="Type to search…" oninput="filterTransactions()" style="min-width:220px;">
+      </div>
+      <button class="btn-clear" onclick="clearTxnFilters()">✕ Clear</button>
+      <button class="btn-export" onclick="alert('CSV download triggered.')">⬇️ Export CSV</button>
+    </div>
+
+    <div class="card" style="padding:0;overflow:hidden;">
+      <div class="tbl-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>Date</th>
+              <th>Entity</th>
+              <th>Bank</th>
+              <th>Narration</th>
+              <th class="r">Debit (₹)</th>
+              <th class="r">Credit (₹)</th>
+              <th class="r">Balance (₹)</th>
+              <th>Category</th>
+            </tr>
+          </thead>
+          <tbody id="txn-body"></tbody>
+        </table>
+      </div>
+    </div>
+
+    <div class="recon">
+      <span>Opening Balance</span>
+      <span class="recon-val">₹72,36,730</span>
+      <span class="recon-eq">+</span>
+      <span>Total Credits</span>
+      <span class="recon-val txt-green">₹19,17,850</span>
+      <span class="recon-eq">−</span>
+      <span>Total Debits</span>
+      <span class="recon-val txt-red">₹11,51,130</span>
+      <span class="recon-eq">=</span>
+      <span>Closing Balance</span>
+      <span class="recon-val" style="font-size:15px;">₹80,03,450</span>
+    </div>
+  </div>
+
+  <!-- ─────────────────────────────── TAB: REVIEW QUEUE -->
+  <div id="tab-review" class="tab-panel">
+    <div class="alert alert-amber">
+      <b>⚠️ 4,147 transactions are Uncategorized.</b> Add matching keywords to <code>keywords_master.xlsx</code>, then click <b>Reload Keywords</b> in the sidebar to re-categorize all transactions automatically.
+    </div>
+
+    <div class="card" style="margin-bottom:16px;">
+      <div class="card-title" style="justify-content:space-between;">
+        <span><span class="dot dot-amber" style="display:inline-block;vertical-align:middle;margin-right:6px;"></span>Top Uncategorized Narration Patterns</span>
+        <button class="btn-reload" onclick="alert('reload_categories() triggered.')">🔄 Reload Keywords &amp; Re-Categorize All</button>
+      </div>
+      <div class="tbl-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>Narration Pattern</th>
+              <th>Entity</th>
+              <th class="r">Occurrences</th>
+              <th class="r">Total Debit (₹)</th>
+              <th>Action</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr><td class="mono">IFT TRANSFER TO AXIS 8218</td><td><span class="sb-badge badge-green">Stores</span></td><td class="r">127</td><td class="r txt-red">₹42,80,000</td><td><span class="sb-badge badge-blue">INTERCOMPANY</span></td></tr>
+            <tr><td class="mono">CLG/000123/HDFC BANK</td><td><span class="sb-badge badge-blue">Ventures</span></td><td class="r">84</td><td class="r txt-red">₹18,60,000</td><td><span class="sb-badge badge-gray">Add keyword</span></td></tr>
+            <tr><td class="mono">NACH/00789/AUTO DEBIT</td><td><span class="sb-badge badge-green">Stores</span></td><td class="r">72</td><td class="r txt-red">₹14,40,000</td><td><span class="sb-badge badge-gray">Add keyword</span></td></tr>
+            <tr><td class="mono">CASH DEPOSIT/BR CODE 045</td><td><span class="sb-badge badge-green">Stores</span></td><td class="r">48</td><td class="r txt-red">₹9,60,000</td><td><span class="sb-badge badge-gray">Add keyword</span></td></tr>
+            <tr><td class="mono">NEFT/AXIS/8901234/TRANSFER</td><td><span class="sb-badge badge-blue">Ventures</span></td><td class="r">41</td><td class="r txt-red">₹8,20,000</td><td><span class="sb-badge badge-gray">Add keyword</span></td></tr>
+            <tr><td class="mono">UPI/PAY/918012345678/YBL</td><td><span class="sb-badge badge-green">Stores</span></td><td class="r">38</td><td class="r txt-red">₹3,80,000</td><td><span class="sb-badge badge-gray">Add keyword</span></td></tr>
+            <tr><td class="mono">IMPS/312456789012/REF</td><td><span class="sb-badge badge-blue">Ventures</span></td><td class="r">33</td><td class="r txt-red">₹3,30,000</td><td><span class="sb-badge badge-gray">Add keyword</span></td></tr>
+            <tr><td class="mono">INT COLL ON SAVING/AXIS</td><td><span class="sb-badge badge-green">Stores</span></td><td class="r">24</td><td class="r txt-muted">—</td><td><span class="sb-badge badge-gray">Add keyword</span></td></tr>
+            <tr><td class="mono">CMS/TRF/0045678/AXIS</td><td><span class="sb-badge badge-green">Stores</span></td><td class="r">18</td><td class="r txt-red">₹1,80,000</td><td><span class="sb-badge badge-amber">Duplicate KW</span></td></tr>
+            <tr><td class="mono">RTGS/HDFC0001234/VENDOR</td><td><span class="sb-badge badge-blue">Ventures</span></td><td class="r">15</td><td class="r txt-red">₹7,50,000</td><td><span class="sb-badge badge-gray">Add keyword</span></td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="card-title"><span class="dot dot-blue"></span>How to Fix Uncategorized Transactions</div>
+      <ol style="padding-left:20px;line-height:2;font-size:13px;color:#374151;">
+        <li>Open <code style="background:#F3F4F6;padding:1px 6px;border-radius:4px;">keywords_master.xlsx</code> in Excel</li>
+        <li>Find the narration pattern in the table above</li>
+        <li>Add the keyword to <b>Key word for Stores</b> or <b>Key word for Ventures</b> column</li>
+        <li>Set the <b>FINAL GROUP</b>, <b>GROUP</b>, and <b>MAIN GROUP</b> for that row</li>
+        <li>Save the file, then click <b>Reload Keywords &amp; Re-Categorize All</b> above</li>
+        <li>Verify in the Transactions tab that the narration is now categorized</li>
+      </ol>
+    </div>
+  </div>
+
+  <!-- ─────────────────────────────── TAB: EXCEPTIONS -->
+  <div id="tab-exceptions" class="tab-panel">
+
+    <div class="grid-3" style="margin-bottom:16px;">
+      <div class="card" style="border-left:4px solid #F59E0B;">
+        <div class="kpi-label">Uncategorized</div>
+        <div class="kpi-val" style="color:#D97706;">4,147</div>
+        <div class="kpi-sub">transactions need keywords</div>
+      </div>
+      <div class="card" style="border-left:4px solid #EF4444;">
+        <div class="kpi-label">Missing Statements</div>
+        <div class="kpi-val red">1</div>
+        <div class="kpi-sub">HDFC-7862 · May 2025</div>
+      </div>
+      <div class="card" style="border-left:4px solid #8B5CF6;">
+        <div class="kpi-label">Large Debits (&gt;₹5L)</div>
+        <div class="kpi-val" style="color:#7C3AED;">7</div>
+        <div class="kpi-sub">₹62,50,000 total</div>
+      </div>
+    </div>
+
+    <!-- Missing Statements -->
+    <div class="card" style="margin-bottom:16px;">
+      <div class="card-title"><span class="dot dot-red"></span>Missing Bank Statements — May 2025</div>
+      <div class="missing-row">
+        <span class="miss-entity">Ventures</span>
+        <span class="miss-bank">HDFC-7862</span>
+        <span class="miss-month">May 2025 — 0 transactions found</span>
+        <span class="miss-badge">MISSING</span>
+      </div>
+      <div class="alert alert-amber" style="margin-top:10px;margin-bottom:0;">
+        <b>Action required:</b> Download the HDFC-7862 May 2025 statement from HDFC NetBanking and drop it into <code>statements/Ventures/HDFC-7862/</code>
+      </div>
+    </div>
+
+    <!-- Large Debits -->
+    <div class="card" style="margin-bottom:16px;">
+      <div class="card-title"><span class="dot dot-red"></span>Large Debits — Above ₹5,00,000</div>
+      <div class="tbl-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>Date</th>
+              <th>Entity</th>
+              <th>Bank</th>
+              <th>Narration</th>
+              <th class="r">Debit (₹)</th>
+              <th>Category</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr><td>2025-05-08</td><td><span class="sb-badge badge-green">Stores</span></td><td class="mono">AXIS-8218</td><td class="mono">NEFT/HDFC/RAJESH TEXTILES/APPAREL</td><td class="r txt-red">₹18,50,000</td><td><span class="sb-badge badge-gray">Sundry Creditors-Apparels</span></td></tr>
+            <tr><td>2025-05-12</td><td><span class="sb-badge badge-blue">Ventures</span></td><td class="mono">AXIS-5623</td><td class="mono">INVESTMENT/FIXED DEPOSIT/AXIS</td><td class="r txt-red">₹15,00,000</td><td><span class="sb-badge badge-gray">INVESTMENT</span></td></tr>
+            <tr><td>2025-05-15</td><td><span class="sb-badge badge-green">Stores</span></td><td class="mono">AXIS-7647</td><td class="mono">NEFT/SBI/FABRIC HOUSE/PUNE</td><td class="r txt-red">₹12,20,000</td><td><span class="sb-badge badge-gray">Sundry Creditors-Apparels</span></td></tr>
+            <tr><td>2025-05-18</td><td><span class="sb-badge badge-green">Stores</span></td><td class="mono">AXIS-8218</td><td class="mono">NEFT/ICICI/GM DISTRIBUTORS/CHENNAI</td><td class="r txt-red">₹9,80,000</td><td><span class="sb-badge badge-gray">Sundry Creditors-GM</span></td></tr>
+            <tr><td>2025-05-20</td><td><span class="sb-badge badge-blue">Ventures</span></td><td class="mono">AXIS-5623</td><td class="mono">RTGS/HDFC/PROPERTY TAX/BBMP</td><td class="r txt-red">₹4,20,000</td><td><span class="sb-badge badge-amber">Uncategorized</span></td></tr>
+            <tr><td>2025-05-22</td><td><span class="sb-badge badge-green">Stores</span></td><td class="mono">AXIS-8218</td><td class="mono">NEFT/KOTAK/NON TRADING VENDOR/MUM</td><td class="r txt-red">₹1,80,000</td><td><span class="sb-badge badge-gray">Sundry Creditors-Non Trading</span></td></tr>
+            <tr><td>2025-05-28</td><td><span class="sb-badge badge-blue">Ventures</span></td><td class="mono">AXIS-5623</td><td class="mono">EMPLOYEE ADVANCE/MAY/BULK PAYOUT</td><td class="r txt-red">₹1,00,000</td><td><span class="sb-badge badge-gray">02-Employee Cost</span></td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+
+    <!-- Transfer Info -->
+    <div class="alert alert-green">
+      <b>ℹ️ INTERBANK / INTERCOMPANY TRANSFERS — Excluded from P&amp;L</b><br>
+      127 transfers totalling ₹42,80,000 are excluded from inflow/outflow calculations.
+      These are classified as <code>INTERCOMPANY</code> in main_group.
+    </div>
+  </div>
+
+  <!-- ─────────────────────────────── TAB: CASH FLOW -->
+  <div id="tab-cashflow" class="tab-panel">
+
+    <div class="cf-controls">
+      <div class="filter-group">
+        <label>Entity</label>
+        <select class="sb-select" id="cf-entity" style="min-width:160px;">
+          <option>All</option>
+          <option>Stores</option>
+          <option>Ventures</option>
+        </select>
+      </div>
+      <div class="filter-group">
+        <label>View</label>
+        <div class="cf-toggle">
+          <button class="active" id="btn-monthly" onclick="switchCFView('monthly')">Monthly</button>
+          <button id="btn-weekly" onclick="switchCFView('weekly')">Weekly</button>
+        </div>
+      </div>
+      <div class="filter-group">
+        <label>From</label>
+        <input type="date" class="sb-input" value="2025-05-01" style="min-width:140px;">
+      </div>
+      <div class="filter-group">
+        <label>To</label>
+        <input type="date" class="sb-input" value="2025-05-31" style="min-width:140px;">
+      </div>
+      <button class="btn-export" style="align-self:flex-end;" onclick="alert('Excel export triggered.')">⬇️ Export Excel</button>
+    </div>
+
+    <!-- MONTHLY VIEW -->
+    <div class="card" id="cf-monthly">
+      <table class="cft">
+        <thead>
+          <tr>
+            <th style="width:70%;text-align:left;">Particulars</th>
+            <th class="r" style="width:30%;">Amount (₹)</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr class="cf-hdr"><td colspan="2"><b>Opening Balance</b></td></tr>
+          <tr><td class="cf-indent">Bank (AXIS-8218)</td><td class="r cf-green">₹31,20,450</td></tr>
+          <tr><td class="cf-indent">Bank (AXIS-7647)</td><td class="r cf-green">₹14,80,000</td></tr>
+          <tr><td class="cf-indent">Bank (AXIS-5623)</td><td class="r cf-green">₹18,60,280</td></tr>
+          <tr><td class="cf-indent">Bank (HDFC-7862)</td><td class="r cf-green">₹7,76,000</td></tr>
+          <tr class="cf-tot"><td>Total Opening Balance</td><td class="r">₹72,36,730</td></tr>
+
+          <tr class="cf-hdr"><td colspan="2"><b>Add Receipts:</b></td></tr>
+          <tr><td class="cf-indent">RAZORPAY</td><td class="r cf-green">₹12,40,000</td></tr>
+          <tr><td class="cf-indent">CC-CMS</td><td class="r cf-green">₹5,20,000</td></tr>
+          <tr><td class="cf-indent">PAYTM</td><td class="r cf-green">₹92,000</td></tr>
+          <tr><td class="cf-indent">02-Other Income</td><td class="r cf-green">₹65,850</td></tr>
+          <tr class="cf-tot"><td>Total Receipts</td><td class="r">₹19,17,850</td></tr>
+
+          <tr class="cf-hdr"><td colspan="2"><b>Less Payouts:</b></td></tr>
+          <tr><td class="cf-indent">Sundry Creditors-Apparels</td><td class="r cf-red">₹3,80,000</td></tr>
+          <tr><td class="cf-indent">02-Employee Cost</td><td class="r cf-red">₹2,80,000</td></tr>
+          <tr><td class="cf-indent">01-Rent</td><td class="r cf-red">₹1,50,000</td></tr>
+          <tr><td class="cf-indent">Statuatory Payment</td><td class="r cf-red">₹1,20,000</td></tr>
+          <tr><td class="cf-indent">Sundry Creditors-GM</td><td class="r cf-red">₹98,000</td></tr>
+          <tr><td class="cf-indent">03-Power and Fuel Expenses</td><td class="r cf-red">₹42,000</td></tr>
+          <tr><td class="cf-indent">17-Bank Charges</td><td class="r cf-red">₹21,130</td></tr>
+          <tr><td class="cf-indent">14-Legal and Professional Expenses</td><td class="r cf-red">₹35,000</td></tr>
+          <tr><td class="cf-indent">10-Travelling &amp; Conveyance Expenses</td><td class="r cf-red">₹25,000</td></tr>
+          <tr class="cf-tot"><td>Total Payouts</td><td class="r cf-red">₹11,51,130</td></tr>
+
+          <tr class="cf-hdr"><td colspan="2"><b>Closing Balance</b></td></tr>
+          <tr><td class="cf-indent">Bank (AXIS-8218)</td><td class="r cf-green">₹38,42,000</td></tr>
+          <tr><td class="cf-indent">Bank (AXIS-7647)</td><td class="r cf-green">₹16,95,000</td></tr>
+          <tr><td class="cf-indent">Bank (AXIS-5623)</td><td class="r cf-green">₹19,80,450</td></tr>
+          <tr><td class="cf-indent">Bank (HDFC-7862)</td><td class="r cf-green">₹4,86,000</td></tr>
+          <tr class="cf-tot"><td>Total Closing Balance</td><td class="r">₹80,03,450</td></tr>
+
+          <tr class="cf-net"><td>Net Cash Flow</td><td class="r" style="color:#2E7D32;font-family:'Courier New',monospace;">₹7,66,720</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <!-- WEEKLY VIEW -->
+    <div class="card" id="cf-weekly" style="display:none;">
+      <table class="cft">
+        <thead>
+          <tr>
+            <th style="width:34%;text-align:left;">Particulars</th>
+            <th class="r" style="width:13%;">W1 (1–7)</th>
+            <th class="r" style="width:13%;">W2 (8–14)</th>
+            <th class="r" style="width:13%;">W3 (15–21)</th>
+            <th class="r" style="width:13%;">W4 (22–31)</th>
+            <th class="r" style="width:14%;">Total</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr class="cf-hdr"><td colspan="6"><b>Opening Balance</b></td></tr>
+          <tr><td class="cf-indent">Bank (AXIS-8218)</td><td class="r cf-green">₹31,20,450</td><td class="r cf-dash">—</td><td class="r cf-dash">—</td><td class="r cf-dash">—</td><td class="r cf-green">₹31,20,450</td></tr>
+          <tr><td class="cf-indent">Bank (AXIS-7647)</td><td class="r cf-green">₹14,80,000</td><td class="r cf-dash">—</td><td class="r cf-dash">—</td><td class="r cf-dash">—</td><td class="r cf-green">₹14,80,000</td></tr>
+          <tr><td class="cf-indent">Bank (AXIS-5623)</td><td class="r cf-green">₹18,60,280</td><td class="r cf-dash">—</td><td class="r cf-dash">—</td><td class="r cf-dash">—</td><td class="r cf-green">₹18,60,280</td></tr>
+          <tr><td class="cf-indent">Bank (HDFC-7862)</td><td class="r cf-green">₹7,76,000</td><td class="r cf-dash">—</td><td class="r cf-dash">—</td><td class="r cf-dash">—</td><td class="r cf-green">₹7,76,000</td></tr>
+          <tr class="cf-tot"><td>Total Opening Balance</td><td class="r">₹72,36,730</td><td class="r cf-dash">—</td><td class="r cf-dash">—</td><td class="r cf-dash">—</td><td class="r">₹72,36,730</td></tr>
+
+          <tr class="cf-hdr"><td colspan="6"><b>Add Receipts:</b></td></tr>
+          <tr><td class="cf-indent">RAZORPAY</td><td class="r cf-green">₹2,80,000</td><td class="r cf-green">₹3,40,000</td><td class="r cf-green">₹2,60,000</td><td class="r cf-green">₹3,60,000</td><td class="r cf-green">₹12,40,000</td></tr>
+          <tr><td class="cf-indent">CC-CMS</td><td class="r cf-green">₹1,20,000</td><td class="r cf-green">₹1,80,000</td><td class="r cf-green">₹1,40,000</td><td class="r cf-green">₹80,000</td><td class="r cf-green">₹5,20,000</td></tr>
+          <tr><td class="cf-indent">PAYTM</td><td class="r cf-green">₹22,000</td><td class="r cf-green">₹30,000</td><td class="r cf-green">₹28,000</td><td class="r cf-green">₹12,000</td><td class="r cf-green">₹92,000</td></tr>
+          <tr><td class="cf-indent">02-Other Income</td><td class="r cf-dash">—</td><td class="r cf-green">₹65,850</td><td class="r cf-dash">—</td><td class="r cf-dash">—</td><td class="r cf-green">₹65,850</td></tr>
+          <tr class="cf-tot"><td>Total Receipts</td><td class="r">₹4,22,000</td><td class="r">₹5,15,850</td><td class="r">₹4,28,000</td><td class="r">₹4,52,000</td><td class="r">₹19,17,850</td></tr>
+
+          <tr class="cf-hdr"><td colspan="6"><b>Less Payouts:</b></td></tr>
+          <tr><td class="cf-indent">Sundry Creditors-Apparels</td><td class="r cf-dash">—</td><td class="r cf-red">₹3,80,000</td><td class="r cf-dash">—</td><td class="r cf-dash">—</td><td class="r cf-red">₹3,80,000</td></tr>
+          <tr><td class="cf-indent">02-Employee Cost</td><td class="r cf-dash">—</td><td class="r cf-dash">—</td><td class="r cf-red">₹2,80,000</td><td class="r cf-dash">—</td><td class="r cf-red">₹2,80,000</td></tr>
+          <tr><td class="cf-indent">01-Rent</td><td class="r cf-red">₹1,50,000</td><td class="r cf-dash">—</td><td class="r cf-dash">—</td><td class="r cf-dash">—</td><td class="r cf-red">₹1,50,000</td></tr>
+          <tr><td class="cf-indent">Statuatory Payment</td><td class="r cf-dash">—</td><td class="r cf-red">₹60,000</td><td class="r cf-dash">—</td><td class="r cf-red">₹60,000</td><td class="r cf-red">₹1,20,000</td></tr>
+          <tr><td class="cf-indent">03-Power and Fuel Expenses</td><td class="r cf-dash">—</td><td class="r cf-dash">—</td><td class="r cf-red">₹42,000</td><td class="r cf-dash">—</td><td class="r cf-red">₹42,000</td></tr>
+          <tr><td class="cf-indent">17-Bank Charges</td><td class="r cf-dash">—</td><td class="r cf-dash">—</td><td class="r cf-dash">—</td><td class="r cf-red">₹21,130</td><td class="r cf-red">₹21,130</td></tr>
+          <tr><td class="cf-indent">14-Legal and Professional</td><td class="r cf-dash">—</td><td class="r cf-red">₹35,000</td><td class="r cf-dash">—</td><td class="r cf-dash">—</td><td class="r cf-red">₹35,000</td></tr>
+          <tr><td class="cf-indent">10-Travelling &amp; Conveyance</td><td class="r cf-dash">—</td><td class="r cf-dash">—</td><td class="r cf-red">₹25,000</td><td class="r cf-dash">—</td><td class="r cf-red">₹25,000</td></tr>
+          <tr class="cf-tot"><td>Total Payouts</td><td class="r cf-red">₹1,50,000</td><td class="r cf-red">₹4,75,000</td><td class="r cf-red">₹3,47,000</td><td class="r cf-red">₹1,79,130</td><td class="r cf-red">₹11,51,130</td></tr>
+
+          <tr class="cf-hdr"><td colspan="6"><b>Closing Balance</b></td></tr>
+          <tr><td class="cf-indent">Bank (AXIS-8218)</td><td class="r cf-dash">—</td><td class="r cf-dash">—</td><td class="r cf-dash">—</td><td class="r cf-green">₹38,42,000</td><td class="r cf-green">₹38,42,000</td></tr>
+          <tr><td class="cf-indent">Bank (AXIS-7647)</td><td class="r cf-dash">—</td><td class="r cf-dash">—</td><td class="r cf-dash">—</td><td class="r cf-green">₹16,95,000</td><td class="r cf-green">₹16,95,000</td></tr>
+          <tr><td class="cf-indent">Bank (AXIS-5623)</td><td class="r cf-dash">—</td><td class="r cf-dash">—</td><td class="r cf-dash">—</td><td class="r cf-green">₹19,80,450</td><td class="r cf-green">₹19,80,450</td></tr>
+          <tr><td class="cf-indent">Bank (HDFC-7862)</td><td class="r cf-dash">—</td><td class="r cf-dash">—</td><td class="r cf-dash">—</td><td class="r cf-green">₹4,86,000</td><td class="r cf-green">₹4,86,000</td></tr>
+          <tr class="cf-tot"><td>Total Closing Balance</td><td class="r cf-dash">—</td><td class="r cf-dash">—</td><td class="r cf-dash">—</td><td class="r">₹80,03,450</td><td class="r">₹80,03,450</td></tr>
+
+          <tr class="cf-net"><td>Net Cash Flow</td>
+            <td class="r" style="color:#2E7D32;font-family:'Courier New',monospace;">₹2,72,000</td>
+            <td class="r" style="color:#2E7D32;font-family:'Courier New',monospace;">₹40,850</td>
+            <td class="r" style="color:#2E7D32;font-family:'Courier New',monospace;">₹81,000</td>
+            <td class="r" style="color:#2E7D32;font-family:'Courier New',monospace;">₹2,72,870</td>
+            <td class="r" style="color:#2E7D32;font-family:'Courier New',monospace;">₹7,66,720</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+
+</main>
+</div>
+
+<!-- ═══════════════════════════════════════════════════════ SCRIPT -->
+<script>
+// ── Tab switching ──────────────────────────────────────────────────────────
+function switchTab(id, btn) {
+  document.querySelectorAll('.tab-panel').forEach(p => p.classList.remove('active'));
+  document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
+  document.getElementById('tab-' + id).classList.add('active');
+  btn.classList.add('active');
+}
+
+// ── Cash flow view toggle ──────────────────────────────────────────────────
+function switchCFView(view) {
+  if (view === 'monthly') {
+    document.getElementById('cf-monthly').style.display = '';
+    document.getElementById('cf-weekly').style.display = 'none';
+    document.getElementById('btn-monthly').classList.add('active');
+    document.getElementById('btn-weekly').classList.remove('active');
+  } else {
+    document.getElementById('cf-monthly').style.display = 'none';
+    document.getElementById('cf-weekly').style.display = '';
+    document.getElementById('btn-monthly').classList.remove('active');
+    document.getElementById('btn-weekly').classList.add('active');
+  }
+}
+
+// ── Indian number formatting ───────────────────────────────────────────────
+function fmtINR(val) {
+  if (!val && val !== 0) return '—';
+  const neg = val < 0;
+  const n = Math.abs(Math.round(val));
+  const s = String(n);
+  let result;
+  if (s.length <= 3) {
+    result = s;
+  } else {
+    const last3 = s.slice(-3);
+    let rem = s.slice(0, -3);
+    const parts = [];
+    while (rem.length > 0) {
+      parts.unshift(rem.slice(-2));
+      rem = rem.slice(0, -2);
+    }
+    result = parts.filter(p => p).join(',') + ',' + last3;
+  }
+  return (neg ? '(₹' : '₹') + result;
+}
+
+// ── Sample transaction data ────────────────────────────────────────────────
+const txnData = [
+  { date:'2025-05-01', entity:'Stores',   bank:'AXIS-8218', narration:'OPENING BALANCE',                        debit:0,       credit:0,       balance:3120450, category:'OPENING BALANCE',         main:'OPENING BALANCE' },
+  { date:'2025-05-02', entity:'Stores',   bank:'AXIS-8218', narration:'RENT/BRIGADE TOWERS/MAY 2025',           debit:150000,  credit:0,       balance:2970450, category:'01-Rent',                  main:'Payment' },
+  { date:'2025-05-03', entity:'Stores',   bank:'AXIS-8218', narration:'RAZORPAY SETTLEMENTS/MAY-W1/00123',      debit:0,       credit:280000,  balance:3250450, category:'RAZORPAY',                 main:'Receipt' },
+  { date:'2025-05-05', entity:'Ventures', bank:'AXIS-5623', narration:'OPENING BALANCE',                        debit:0,       credit:0,       balance:1860280, category:'OPENING BALANCE',         main:'OPENING BALANCE' },
+  { date:'2025-05-06', entity:'Stores',   bank:'AXIS-7647', narration:'CC-CMS RECEIPT/MAY WEEK1',               debit:0,       credit:120000,  balance:1600000, category:'CC-CMS',                   main:'Receipt' },
+  { date:'2025-05-08', entity:'Stores',   bank:'AXIS-8218', narration:'NEFT/HDFC/RAJESH TEXTILES/APPAREL',      debit:1850000, credit:0,       balance:1400450, category:'Sundry Creditors-Apparels',main:'Payment' },
+  { date:'2025-05-10', entity:'Ventures', bank:'AXIS-5623', narration:'LEGAL/ADVOCATE FEES/MUMBAI',             debit:35000,   credit:0,       balance:1825280, category:'14-Legal and Professional', main:'Payment' },
+  { date:'2025-05-12', entity:'Ventures', bank:'AXIS-5623', narration:'INVESTMENT/FIXED DEPOSIT/AXIS',          debit:1500000, credit:0,       balance:325280,  category:'INVESTMENT',               main:'INTERCOMPANY' },
+  { date:'2025-05-12', entity:'Stores',   bank:'AXIS-8218', narration:'RAZORPAY SETTLEMENTS/MAY-W2',            debit:0,       credit:340000,  balance:1740450, category:'RAZORPAY',                 main:'Receipt' },
+  { date:'2025-05-14', entity:'Ventures', bank:'AXIS-5623', narration:'CC-CMS/MAY-W2/SETTLEMENT',               debit:0,       credit:180000,  balance:505280,  category:'CC-CMS',                   main:'Receipt' },
+  { date:'2025-05-15', entity:'Stores',   bank:'AXIS-8218', narration:'SALARY MAY 2025/PAYROLL BATCH',          debit:280000,  credit:0,       balance:1460450, category:'02-Employee Cost',         main:'Payment' },
+  { date:'2025-05-15', entity:'Stores',   bank:'AXIS-7647', narration:'NEFT/SBI/FABRIC HOUSE/PUNE',             debit:1220000, credit:0,       balance:380000,  category:'Sundry Creditors-Apparels',main:'Payment' },
+  { date:'2025-05-17', entity:'Stores',   bank:'AXIS-8218', narration:'POWER BILL/BESCOM/MAY 2025',             debit:42000,   credit:0,       balance:1418450, category:'03-Power and Fuel Expenses',main:'Payment' },
+  { date:'2025-05-18', entity:'Stores',   bank:'AXIS-8218', narration:'NEFT/ICICI/GM DISTRIBUTORS/CHENNAI',     debit:980000,  credit:0,       balance:438450,  category:'Sundry Creditors-GM',      main:'Payment' },
+  { date:'2025-05-19', entity:'Stores',   bank:'AXIS-8218', narration:'RAZORPAY SETTLEMENTS/MAY-W3',            debit:0,       credit:260000,  balance:698450,  category:'RAZORPAY',                 main:'Receipt' },
+  { date:'2025-05-20', entity:'Ventures', bank:'AXIS-5623', narration:'RTGS/HDFC/PROPERTY TAX/BBMP',            debit:420000,  credit:0,       balance:85280,   category:'Uncategorized',            main:'' },
+  { date:'2025-05-21', entity:'Ventures', bank:'AXIS-5623', narration:'GST PAYMENT/MAY 2025/GSTR-3B',           debit:85000,   credit:0,       balance:280,     category:'Statuatory Payment',       main:'Payment' },
+  { date:'2025-05-22', entity:'Stores',   bank:'AXIS-8218', narration:'PAYTM SETTLEMENTS/MAY',                  debit:0,       credit:92000,   balance:790450,  category:'PAYTM',                    main:'Receipt' },
+  { date:'2025-05-25', entity:'Stores',   bank:'AXIS-8218', narration:'TRAVELLING/SALES TEAM/MAY',              debit:25000,   credit:0,       balance:765450,  category:'10-Travelling & Conveyance',main:'Payment' },
+  { date:'2025-05-28', entity:'Stores',   bank:'AXIS-8218', narration:'BANK CHARGES/MAY 2025/AXIS',             debit:21130,   credit:0,       balance:744320,  category:'17-Bank Charges',          main:'Payment' },
+  { date:'2025-05-29', entity:'Ventures', bank:'AXIS-5623', narration:'RAZORPAY SETTLEMENTS/MAY-W4',            debit:0,       credit:360000,  balance:360280,  category:'RAZORPAY',                 main:'Receipt' },
+  { date:'2025-05-30', entity:'Stores',   bank:'AXIS-8218', narration:'EPF CONTRIBUTION/MAY 2025',              debit:45000,   credit:0,       balance:699320,  category:'Statuatory Payment',       main:'Payment' },
+  { date:'2025-05-31', entity:'Stores',   bank:'AXIS-8218', narration:'IFT TO AXIS 7647/INTERNAL',              debit:500000,  credit:0,       balance:199320,  category:'Uncategorized',            main:'INTERCOMPANY' },
+  { date:'2025-05-31', entity:'Ventures', bank:'HDFC-7862', narration:'INSURANCE PREMIUM/LIC/MAY',              debit:45000,   credit:0,       balance:486000,  category:'09-Insurance',             main:'Payment' },
+];
+
+// ── Render transactions table ──────────────────────────────────────────────
+function renderTransactions(data) {
+  const tbody = document.getElementById('txn-body');
+  tbody.innerHTML = '';
+  if (data.length === 0) {
+    tbody.innerHTML = '<tr><td colspan="8" style="text-align:center;color:#9CA3AF;padding:24px;">No transactions match the current filters.</td></tr>';
+    return;
+  }
+  data.forEach(row => {
+    const isOB = row.category === 'OPENING BALANCE';
+    const isUncat = row.category === 'Uncategorized';
+    const catBadge = isUncat
+      ? `<span class="sb-badge badge-amber">${row.category}</span>`
+      : isOB
+      ? `<span class="sb-badge badge-blue">${row.category}</span>`
+      : `<span class="sb-badge badge-gray" style="font-size:10px;">${row.category}</span>`;
+    const entBadge = row.entity === 'Stores'
+      ? `<span class="sb-badge badge-green">${row.entity}</span>`
+      : `<span class="sb-badge badge-blue">${row.entity}</span>`;
+    tbody.innerHTML += `
+      <tr>
+        <td class="mono" style="color:#6B7280;">${row.date}</td>
+        <td>${entBadge}</td>
+        <td class="mono" style="font-size:11px;">${row.bank}</td>
+        <td style="max-width:280px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title="${row.narration}" class="mono" style="font-size:12px;">${row.narration}</td>
+        <td class="r">${row.debit > 0 ? '<span class="txt-red">'+fmtINR(row.debit)+'</span>' : '<span class="txt-muted">—</span>'}</td>
+        <td class="r">${row.credit > 0 ? '<span class="txt-green">'+fmtINR(row.credit)+'</span>' : '<span class="txt-muted">—</span>'}</td>
+        <td class="r mono" style="font-size:11px;color:#6B7280;">${row.balance ? fmtINR(row.balance) : '—'}</td>
+        <td>${catBadge}</td>
+      </tr>`;
+  });
+}
+
+let filteredTxn = [...txnData];
+renderTransactions(filteredTxn);
+
+function filterTransactions() {
+  const fg    = document.getElementById('fg-filter').value.trim();
+  const mg    = document.getElementById('mg-filter').value.trim();
+  const srch  = document.getElementById('narr-search').value.trim().toUpperCase();
+  filteredTxn = txnData.filter(r => {
+    if (fg && r.category !== fg) return false;
+    if (mg && r.main !== mg) return false;
+    if (srch && !r.narration.toUpperCase().includes(srch)) return false;
+    return true;
+  });
+  renderTransactions(filteredTxn);
+}
+
+function clearTxnFilters() {
+  document.getElementById('fg-filter').value = '';
+  document.getElementById('mg-filter').value = '';
+  document.getElementById('narr-search').value = '';
+  filteredTxn = [...txnData];
+  renderTransactions(filteredTxn);
+}
+
+// ── Category data ──────────────────────────────────────────────────────────
+const catData = [
+  { name:'Sundry Creditors-Apparels', main:'Payment', val:4580000 },
+  { name:'02-Employee Cost',          main:'Payment', val:2860000 },
+  { name:'INVESTMENT',                main:'Payment', val:2200000 },
+  { name:'Sundry Creditors-GM',       main:'Payment', val:1840000 },
+  { name:'01-Rent',                   main:'Payment', val:1800000 },
+  { name:'Statuatory Payment',        main:'Payment', val:1420000 },
+  { name:'Sundry Creditors-Non Trdg', main:'Payment', val:1280000 },
+  { name:'03-Power and Fuel',         main:'Payment', val:840000  },
+  { name:'Sundry Cred for Expenses',  main:'Payment', val:680000  },
+  { name:'17-Bank Charges',           main:'Payment', val:280000  },
+  { name:'Others',                    main:'Payment', val:2062130 },
+];
+const totalOutflow = catData.reduce((s, c) => s + c.val, 0);
+
+// ── Category table ─────────────────────────────────────────────────────────
+const ctBody = document.getElementById('category-table-body');
+catData.forEach(c => {
+  const pct = (c.val / totalOutflow * 100).toFixed(1);
+  ctBody.innerHTML += `
+    <tr>
+      <td style="font-weight:600;">${c.name}</td>
+      <td><span class="sb-badge badge-red">${c.main}</span></td>
+      <td class="r txt-red mono">${fmtINR(c.val)}</td>
+      <td class="r" style="font-weight:700;">${pct}%</td>
+      <td>
+        <div class="prog-bar"><div class="prog-fill" style="width:${pct}%;background:${pct > 20 ? '#EF4444' : pct > 10 ? '#F59E0B' : '#22C55E'};"></div></div>
+      </td>
+    </tr>`;
+});
+
+// ── Bar Chart (Monthly Trend) ──────────────────────────────────────────────
+const barCtx = document.getElementById('barChart').getContext('2d');
+new Chart(barCtx, {
+  type: 'bar',
+  data: {
+    labels: ['Dec 2024', 'Jan 2025', 'Feb 2025', 'Mar 2025', 'Apr 2025', 'May 2025'],
+    datasets: [
+      {
+        label: 'Inflow',
+        data: [3820000, 4280000, 4560000, 5240000, 4820000, 1917850],
+        backgroundColor: 'rgba(34,197,94,0.75)',
+        borderRadius: 5,
+        borderSkipped: false,
+      },
+      {
+        label: 'Outflow',
+        data: [3150000, 3540000, 3820000, 4280000, 3940000, 1151130],
+        backgroundColor: 'rgba(239,68,68,0.65)',
+        borderRadius: 5,
+        borderSkipped: false,
+      }
+    ]
+  },
+  options: {
+    responsive: true,
+    maintainAspectRatio: true,
+    plugins: {
+      legend: { position: 'top', labels: { font: { size: 11 }, boxWidth: 12, usePointStyle: true } },
+      tooltip: {
+        callbacks: {
+          label: ctx => ' ' + fmtINR(ctx.raw)
+        }
+      }
+    },
+    scales: {
+      x: { grid: { display: false }, ticks: { font: { size: 11 } } },
+      y: {
+        grid: { color: '#F3F4F6' },
+        ticks: {
+          font: { size: 10 },
+          callback: v => '₹' + (v >= 1000000 ? (v/100000).toFixed(0)+'L' : (v/1000).toFixed(0)+'K')
+        }
+      }
+    }
+  }
+});
+
+// ── Donut Chart (Categories) ───────────────────────────────────────────────
+const palette = ['#EF4444','#F59E0B','#8B5CF6','#3B82F6','#22C55E','#EC4899','#14B8A6','#F97316','#6366F1','#84CC16','#9CA3AF'];
+const donutCtx = document.getElementById('donutChart').getContext('2d');
+new Chart(donutCtx, {
+  type: 'doughnut',
+  data: {
+    labels: catData.map(c => c.name),
+    datasets: [{
+      data: catData.map(c => c.val),
+      backgroundColor: palette,
+      borderWidth: 2,
+      borderColor: '#fff',
+      hoverOffset: 6
+    }]
+  },
+  options: {
+    responsive: true,
+    maintainAspectRatio: true,
+    cutout: '65%',
+    plugins: {
+      legend: { display: false },
+      tooltip: {
+        callbacks: {
+          label: ctx => ' ' + fmtINR(ctx.raw) + ' (' + (ctx.raw/totalOutflow*100).toFixed(1) + '%)'
+        }
+      }
+    }
+  }
+});
+
+// ── Donut legend ──────────────────────────────────────────────────────────
+const legContainer = document.getElementById('donut-legend');
+catData.forEach((c, i) => {
+  legContainer.innerHTML += `
+    <div class="legend-item">
+      <span class="legend-dot" style="background:${palette[i]};"></span>
+      <span class="legend-label">${c.name}</span>
+      <span class="legend-val">${fmtINR(c.val)}</span>
+    </div>`;
+});
+
+// ── Apply sidebar filters (visual mock) ───────────────────────────────────
+function applyFilters() {
+  const entity = document.getElementById('sb-entity').value;
+  const bank   = document.getElementById('sb-bank').value;
+  // In a real app this would re-query the DB and re-render everything.
+  // Here we just filter the transactions table as a demo.
+  filteredTxn = txnData.filter(r => {
+    if (entity !== 'All' && r.entity !== entity) return false;
+    if (bank   !== 'All' && r.bank   !== bank  ) return false;
+    return true;
+  });
+  renderTransactions(filteredTxn);
+}
+</script>
+</body>
+</html>
