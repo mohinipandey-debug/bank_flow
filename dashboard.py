@@ -3977,3 +3977,43 @@ elif selected_tab == "Upload":
         if _up_total_ins > 0:
             st.cache_data.clear()
             st.success("Cache cleared — refresh any tab to see updated data.")
+
+    # ── DB Restore ────────────────────────────────────────────────────────────
+    st.markdown("---")
+    st.markdown("### Restore Database")
+    st.markdown("""
+<div style="background:#FFF8E1; border-left:4px solid #F59E0B;
+     border-radius:6px; padding:10px 16px; margin-bottom:16px;
+     font-size:13px; color:#92400E;">
+    ⚠️ Upload a <b>bankflow.db</b> file to restore all historical data.
+    This will <b>replace</b> the current database entirely.
+</div>
+""", unsafe_allow_html=True)
+
+    _db_file = st.file_uploader(
+        "Select bankflow.db",
+        type=["db"],
+        key="db_restore_file",
+        help="Upload your existing bankflow.db to restore all data."
+    )
+
+    _db_confirm = st.checkbox("I understand this will replace the current database", key="db_restore_confirm")
+    _db_btn = st.button("🗄️ Restore Database", key="db_restore_btn",
+                        disabled=not (_db_file and _db_confirm),
+                        type="primary")
+
+    if _db_btn and _db_file and _db_confirm:
+        import shutil as _shutil
+        from config import DATABASE_FILE as _DB_PATH
+        try:
+            _os_up.makedirs(_os_up.path.dirname(_DB_PATH), exist_ok=True)
+            _backup_path = _DB_PATH + ".bak"
+            if _os_up.path.exists(_DB_PATH):
+                _shutil.copy2(_DB_PATH, _backup_path)
+            with open(_DB_PATH, "wb") as _f:
+                _f.write(_db_file.getbuffer())
+            st.cache_data.clear()
+            st.success(f"✅ Database restored successfully! ({_db_file.size:,} bytes written)")
+            st.info("A backup of the previous database was saved as bankflow.db.bak")
+        except Exception as _e:
+            st.error(f"❌ Restore failed: {_e}")
