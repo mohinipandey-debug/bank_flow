@@ -2,7 +2,7 @@
 
 ENTITIES = {
     "Stores":   ["AXIS-8218", "AXIS-7647", "HDFC-5881"],
-    "Ventures": ["AXIS-5623", "HDFC-7862", "HDFC-7640"],
+    "Ventures": ["AXIS-5623", "HDFC-7862", "HDFC-7640", "SBI-0211"],
 }
 
 # ─── AXIS FORMAT ───────────────────────────────────────────────────────────────

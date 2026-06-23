@@ -16,6 +16,8 @@ from database import (
     get_transaction_count, get_closing_balance, get_paginated_transactions,
     get_transfer_reconciliation, get_monthly_trend,
     get_yoy_comparison, get_top_expenses_comparison, get_weekly_cash_position,
+    log_upload, get_upload_trail, delete_upload,
+    get_account_balances, get_cash_at_stores, set_cash_at_stores,
 )
 from config import ENTITIES, LARGE_DEBIT_THRESHOLD, DATABASE_FILE
 
@@ -1672,7 +1674,8 @@ if by_bank_bal:
         closing_date = by_bank_dt.get(sel_bank, "")
         _cb_sub      = f"As of {closing_date}" if closing_date else "No transactions"
     else:
-        closing_date = max(by_bank_dt.values()) if by_bank_dt else ""
+        _dt_vals     = [v for v in by_bank_dt.values() if v]
+        closing_date = max(_dt_vals) if _dt_vals else ""
         _cb_sub      = " | ".join(
             f"{bk}: ₹{v:,.0f}" for bk, v in sorted(by_bank_bal.items())
         )
@@ -1680,6 +1683,13 @@ else:
     closing_balance = 0.0
     closing_date    = ""
     _cb_sub         = "No transactions"
+
+# ─── Cash at Stores + investment totals for header TOTAL CASH POSITION ────────
+_cash_at_stores = get_cash_at_stores()
+_inv_all        = get_investment_summary()
+_fd_total_hdr   = sum(r["current_value"] for r in _inv_all if r["scheme_type"] == "FD")
+_mf_total_hdr   = sum(r["current_value"] for r in _inv_all if r["scheme_type"] == "MF")
+_total_cash_pos = closing_balance + _cash_at_stores + _fd_total_hdr + _mf_total_hdr
 
 # ─── Transaction count (lightweight SQL COUNT — no row loading) ───────────────
 txn_count = _cached_count(sel_entity, sel_bank, sel_month, None)
@@ -1785,8 +1795,8 @@ st.markdown(f"""
     <div class="kpi-strip">
         <div class="kpi-strip-hero">
             <div class="kpi-strip-label">TOTAL CASH POSITION</div>
-            <div style="font-size:36px;font-weight:800;color:#FFFFFF;letter-spacing:-1.2px;line-height:1;margin-bottom:3px;">{fmt_cr(closing_balance)}</div>
-            <div class="kpi-strip-sub kpi-neutral">Closing balance · {period_label}</div>
+            <div style="font-size:36px;font-weight:800;color:#FFFFFF;letter-spacing:-1.2px;line-height:1;margin-bottom:3px;">{fmt_cr(_total_cash_pos)}</div>
+            <div class="kpi-strip-sub kpi-neutral">Bank {fmt_cr(closing_balance)} · Stores {fmt_cr(_cash_at_stores)} · FD {fmt_cr(_fd_total_hdr)} · MF {fmt_cr(_mf_total_hdr)}</div>
         </div>
         <div class="kpi-strip-item">
             <div class="kpi-strip-label">TOTAL RECEIPTS</div>
@@ -1896,27 +1906,88 @@ selected_tab = st.session_state["active_tab"]
 # ══════════════════════════════════════════════════════════════════════════════
 if selected_tab == "Summary":
     st.markdown(LIVE_BANNER, unsafe_allow_html=True)
-    # ── Entity Breakdown ──────────────────────────────────────────────────────
-    _by_ent = summary.get("by_entity", [])
-    if _by_ent:
-        st.markdown('<div class="section-header" style="margin-bottom:10px;">Entity Breakdown</div>',
-                    unsafe_allow_html=True)
-        _ent_html = '<div class="ent-cards">'
-        for _ent in _by_ent:
-            _e_net = (_ent.get("inflow") or 0) - (_ent.get("outflow") or 0)
-            _e_cls = "pos" if _e_net >= 0 else "neg"
-            _ent_html += (
-                f'<div class="ent-card">'
-                f'<div class="ent-card-name">{_ent["entity"]}</div>'
-                f'<div class="ent-card-net {_e_cls}">{fmt_cr(_e_net)}</div>'
-                f'<div class="ent-card-row"><span>Receipts</span>'
-                f'<span class="ent-card-in">{fmt_cr(_ent.get("inflow", 0))}</span></div>'
-                f'<div class="ent-card-row"><span>Payouts</span>'
-                f'<span class="ent-card-out">{fmt_cr(_ent.get("outflow", 0))}</span></div>'
-                f'</div>'
+    # ── Account Balance Summary ───────────────────────────────────────────────
+    _acct_balances = get_account_balances(financial_year=sel_fy if sel_fy != "All" else None)
+
+    def _render_entity_subtotal(rows, entity_name):
+        sub = sum(r["balance"] for r in rows if r["entity"] == entity_name)
+        return sub
+
+    st.markdown('<div class="section-header" style="margin-bottom:10px;">Account Balance Summary</div>',
+                unsafe_allow_html=True)
+
+    _abs_css = """
+<style>
+.abs-table{width:100%;border-collapse:collapse;font-size:13px;font-family:'Inter',sans-serif;}
+.abs-table th{background:#1B2B4B;color:#fff;padding:7px 12px;text-align:left;font-weight:600;font-size:11px;letter-spacing:.05em;text-transform:uppercase;}
+.abs-table td{padding:7px 12px;border-bottom:1px solid #EDF0F5;color:#2D3748;}
+.abs-table tr:hover td{background:#F7F9FC;}
+.abs-subtotal td{background:#F0F4FF;font-weight:700;color:#1B2B4B;}
+.abs-total td{background:#1B2B4B;color:#fff;font-weight:800;font-size:14px;}
+.abs-bal{text-align:right;font-variant-numeric:tabular-nums;}
+.abs-pill{display:inline-block;padding:2px 8px;border-radius:10px;font-size:10px;font-weight:700;letter-spacing:.04em;}
+.abs-stores{background:#DBEAFE;color:#1E40AF;}
+.abs-ventures{background:#FCE7F3;color:#9D174D;}
+</style>"""
+    st.markdown(_abs_css, unsafe_allow_html=True)
+
+    _abs_rows_html = ""
+    for _entity_name in ["Stores", "Ventures"]:
+        _entity_rows = [r for r in _acct_balances if r["entity"] == _entity_name]
+        for _ar in _entity_rows:
+            _pill_cls = "abs-stores" if _entity_name == "Stores" else "abs-ventures"
+            _abs_rows_html += (
+                f'<tr>'
+                f'<td><span class="abs-pill {_pill_cls}">{_entity_name}</span></td>'
+                f'<td>{_ar["bank_id"]}</td>'
+                f'<td>{_ar["bank"]}</td>'
+                f'<td>{_ar["purpose"]}</td>'
+                f'<td class="abs-bal">₹{_ar["balance"]:,.0f}</td>'
+                f'</tr>'
             )
-        _ent_html += '</div>'
-        st.markdown(_ent_html, unsafe_allow_html=True)
+        _sub = _render_entity_subtotal(_acct_balances, _entity_name)
+        _abs_rows_html += (
+            f'<tr class="abs-subtotal">'
+            f'<td colspan="4">{_entity_name} Subtotal</td>'
+            f'<td class="abs-bal">₹{_sub:,.0f}</td>'
+            f'</tr>'
+        )
+
+    _bank_subtotal = sum(r["balance"] for r in _acct_balances)
+    _grand_total   = _bank_subtotal + _cash_at_stores + _fd_total_hdr + _mf_total_hdr
+
+    _abs_rows_html += (
+        f'<tr class="abs-subtotal">'
+        f'<td colspan="4">Cash at Stores</td>'
+        f'<td class="abs-bal">₹{_cash_at_stores:,.0f}</td>'
+        f'</tr>'
+        f'<tr class="abs-subtotal">'
+        f'<td colspan="4">Fixed Deposits (FD)</td>'
+        f'<td class="abs-bal">₹{_fd_total_hdr:,.0f}</td>'
+        f'</tr>'
+        f'<tr class="abs-subtotal">'
+        f'<td colspan="4">Mutual Funds (MF)</td>'
+        f'<td class="abs-bal">₹{_mf_total_hdr:,.0f}</td>'
+        f'</tr>'
+        f'<tr class="abs-total">'
+        f'<td colspan="4">TOTAL CASH POSITION</td>'
+        f'<td class="abs-bal">₹{_grand_total:,.0f}</td>'
+        f'</tr>'
+    )
+
+    st.markdown(f"""
+<table class="abs-table">
+  <thead>
+    <tr>
+      <th>Entity</th><th>Account ID</th><th>Bank</th><th>Purpose</th><th style="text-align:right;">Balance</th>
+    </tr>
+  </thead>
+  <tbody>
+    {_abs_rows_html}
+  </tbody>
+</table>
+""", unsafe_allow_html=True)
+    st.markdown("<br>", unsafe_allow_html=True)
 
     # ── Charts row ────────────────────────────────────────────────────────────
     _ch_left, _ch_right = st.columns([3, 2])
@@ -2635,6 +2706,68 @@ elif selected_tab == "Exception Report":
         </span>
     </div>
     """, unsafe_allow_html=True)
+
+    st.markdown("")
+
+    # ── Upload Trail ──────────────────────────────────────────────────────────
+    st.markdown("#### Upload Trail")
+    st.caption("History of all loaded statements. Click Delete to remove a wrongly uploaded file.")
+    _trail = get_upload_trail()
+    if not _trail:
+        st.info("No statements uploaded yet.")
+    else:
+        _th = st.columns([2, 1, 1, 1, 1, 1, 0.8])
+        for _tc, _tl in zip(_th, ["Filename", "Entity", "Bank", "FY",
+                                    "Rows", "Uploaded At", "Action"]):
+            with _tc:
+                st.markdown(
+                    f'<div style="font-size:11px;font-weight:700;color:#8896A5;'
+                    f'text-transform:uppercase;">{_tl}</div>',
+                    unsafe_allow_html=True)
+        st.markdown('<hr style="margin:4px 0;border:none;border-top:1px solid #E8ECF0;">',
+                    unsafe_allow_html=True)
+        for _t in _trail:
+            _tc = st.columns([2, 1, 1, 1, 1, 1, 0.8])
+            with _tc[0]:
+                st.markdown(f'<div style="font-size:12px;color:#1A202C;padding:4px 0;'
+                            f'word-break:break-all;">{_t["filename"]}</div>',
+                            unsafe_allow_html=True)
+            with _tc[1]:
+                st.markdown(f'<div style="font-size:12px;color:#4A5568;padding:4px 0;">'
+                            f'{_t["entity"] or "—"}</div>', unsafe_allow_html=True)
+            with _tc[2]:
+                st.markdown(f'<div style="font-size:12px;color:#4A5568;padding:4px 0;">'
+                            f'{_t["bank"] or "—"}</div>', unsafe_allow_html=True)
+            with _tc[3]:
+                st.markdown(f'<div style="font-size:12px;color:#4A5568;padding:4px 0;">'
+                            f'{_t["financial_year"] or "—"}</div>', unsafe_allow_html=True)
+            with _tc[4]:
+                st.markdown(f'<div style="font-size:12px;color:#4A5568;padding:4px 0;">'
+                            f'{_t["rows_inserted"]:,}</div>', unsafe_allow_html=True)
+            with _tc[5]:
+                st.markdown(f'<div style="font-size:12px;color:#8896A5;padding:4px 0;">'
+                            f'{_t["uploaded_at"][:16]}</div>', unsafe_allow_html=True)
+            with _tc[6]:
+                if st.button("Delete", key=f"del_upload_{_t['id']}"):
+                    st.session_state[f"confirm_del_{_t['id']}"] = True
+                    st.rerun()
+            if st.session_state.get(f"confirm_del_{_t['id']}"):
+                st.warning(f"Delete **{_t['filename']}** ({_t['rows_inserted']:,} rows)? "
+                           f"This cannot be undone.")
+                _dc1, _dc2 = st.columns([1, 4])
+                with _dc1:
+                    if st.button("Confirm Delete", key=f"confirm_yes_{_t['id']}"):
+                        _deleted = delete_upload(_t["id"])
+                        st.success(f"Deleted {_deleted:,} rows from {_t['filename']}")
+                        del st.session_state[f"confirm_del_{_t['id']}"]
+                        st.cache_data.clear()
+                        st.rerun()
+                with _dc2:
+                    if st.button("Cancel", key=f"confirm_no_{_t['id']}"):
+                        del st.session_state[f"confirm_del_{_t['id']}"]
+                        st.rerun()
+            st.markdown('<hr style="margin:2px 0;border:none;border-top:1px solid #F0F0F0;">',
+                        unsafe_allow_html=True)
 
     st.markdown("")
 
@@ -3639,6 +3772,33 @@ elif selected_tab == "Investments":
 
     st.markdown("<br>", unsafe_allow_html=True)
 
+    # ── Cash at Stores ────────────────────────────────────────────────────────
+    st.markdown('<div class="section-header" style="margin-bottom:10px;">Cash at Stores</div>',
+                unsafe_allow_html=True)
+    _cas_col1, _cas_col2, _cas_col3 = st.columns([2, 2, 3])
+    with _cas_col1:
+        _cur_cas = get_cash_at_stores()
+        st.markdown(f"""
+<div style="background:#FFFFFF;border-radius:10px;padding:16px 20px;
+     border:1px solid #E8ECF0;border-top:3px solid #0EA5E9;
+     box-shadow:0 1px 3px rgba(0,0,0,0.04);">
+  <div style="font-size:10px;font-weight:700;color:#8896A5;letter-spacing:0.1em;
+       text-transform:uppercase;margin-bottom:6px;">Current Value</div>
+  <div style="font-size:22px;font-weight:700;color:#0EA5E9;">₹{_cur_cas:,.0f}</div>
+</div>
+""", unsafe_allow_html=True)
+    with _cas_col2:
+        _new_cas = st.number_input(
+            "Update Cash at Stores (₹)", min_value=0.0, step=1000.0,
+            value=float(get_cash_at_stores()), format="%.0f",
+            key="cas_input"
+        )
+        if st.button("Save", key="cas_save"):
+            set_cash_at_stores(_new_cas)
+            st.success(f"Saved ₹{_new_cas:,.0f}")
+            st.rerun()
+    st.markdown("<br>", unsafe_allow_html=True)
+
     # ── Investment table helper ───────────────────────────────────────────────
     def render_investment_table(schemes):
         if not schemes:
@@ -3878,7 +4038,7 @@ elif selected_tab == "Upload":
 <div style="background:#EBF4FF; border-left:4px solid #3B82F6;
      border-radius:6px; padding:10px 16px; margin-bottom:20px;
      font-size:13px; color:#1E40AF;">
-    📂 Select entity and account, then upload one or more bank statement files (.xlsx / .xls).
+    Select entity and account, then upload one bank statement file (.xlsx / .xls).
     Duplicate transactions are automatically skipped.
 </div>
 """, unsafe_allow_html=True)
@@ -3899,84 +4059,132 @@ elif selected_tab == "Upload":
             key="up_account",
         )
 
-    _up_files = st.file_uploader(
-        "Bank Statement File(s)",
+    # Uploader key rotation — allows auto-clear after processing
+    if "uploader_key" not in st.session_state:
+        st.session_state["uploader_key"] = 0
+    if st.session_state.get("_clear_result_next"):
+        st.session_state.pop("last_process_result", None)
+        st.session_state.pop("_clear_result_next", None)
+
+    _uploaded_file = st.file_uploader(
+        "Bank Statement File",
+        accept_multiple_files=False,
         type=["xlsx", "xls"],
-        accept_multiple_files=True,
-        key="up_files",
-        help="AXIS: .xlsx   |   HDFC: .xls",
+        key=f"uploader_{st.session_state['uploader_key']}",
+        help="AXIS: .xlsx   |   HDFC: .xls   |   One file at a time.",
     )
+    if _uploaded_file is not None:
+        st.session_state["_clear_result_next"] = True
 
-    _up_btn = st.button("⬆️ Process", key="up_process_btn",
-                        disabled=not _up_files,
-                        type="primary")
+    # Result banner (persists across reruns until dismissed)
+    _up_result = st.session_state.get("last_process_result")
+    if _up_result:
+        if _up_result["status"] == "success":
+            st.markdown(f"""
+<div style="background:#F0FFF4; border-left:4px solid #38A169;
+     border-radius:6px; padding:12px 16px; margin:8px 0; font-size:13px;">
+    <b>{_up_result['filename']}</b> processed successfully<br>
+    <span style="color:#276749;">
+        {_up_result.get('entity','?')} — {_up_result.get('bank','?')} &nbsp;|&nbsp;
+        {_up_result.get('inserted',0):,} rows inserted &nbsp;|&nbsp;
+        {_up_result.get('skipped',0):,} duplicates skipped
+    </span>
+</div>""", unsafe_allow_html=True)
+        elif _up_result["status"] == "already_loaded":
+            st.markdown(f"""
+<div style="background:#FFFFF0; border-left:4px solid #D69E2E;
+     border-radius:6px; padding:12px 16px; margin:8px 0; font-size:13px;">
+    <b>{_up_result['filename']}</b> — already loaded<br>
+    <span style="color:#744210;">
+        All {_up_result.get('skipped',0):,} rows already exist in the database.
+    </span>
+</div>""", unsafe_allow_html=True)
+        else:
+            st.markdown(f"""
+<div style="background:#FFF5F5; border-left:4px solid #E53E3E;
+     border-radius:6px; padding:12px 16px; margin:8px 0; font-size:13px; color:#742A2A;">
+    <b>{_up_result['filename']}</b> — {_up_result.get('message','')}
+</div>""", unsafe_allow_html=True)
+        if st.button("Dismiss", key="dismiss_result"):
+            del st.session_state["last_process_result"]
+            st.rerun()
 
-    if _up_btn and _up_files:
-        # ensure processor is importable from dashboard's working dir
+    if st.button("Process Statement", key="up_process_btn",
+                 disabled=not _uploaded_file, type="primary"):
         _script_dir = _os_up.path.dirname(_os_up.path.abspath(__file__))
         if _script_dir not in _sys.path:
             _sys.path.insert(0, _script_dir)
-
         from processor import process_file as _process_file
         from categorizer import load_keywords as _load_kw
 
-        _up_keywords = _load_kw()
-        _up_total_ins = 0
-        _up_total_skp = 0
-        _up_results   = []
-
-        for _uf in _up_files:
-            _ext = _os_up.path.splitext(_uf.name)[1].lower() or ".xlsx"
+        _suffix  = _os_up.path.splitext(_uploaded_file.name)[1].lower() or ".xlsx"
+        _tmp_path = None
+        try:
             with _tempfile.NamedTemporaryFile(
-                suffix=_ext, delete=False, dir=_script_dir
-            ) as _tmp:
-                _tmp.write(_uf.getbuffer())
+                    delete=False, suffix=_suffix, dir=_script_dir) as _tmp:
+                _tmp.write(_uploaded_file.getbuffer())
                 _tmp_path = _tmp.name
 
-            try:
+            with st.spinner(f"Processing {_uploaded_file.name}..."):
+                _kw = _load_kw()
                 _ins, _skp = _process_file(
                     _tmp_path,
-                    keywords=_up_keywords,
+                    keywords=_kw,
                     entity=_up_entity,
                     bank=_up_account,
                     delete_after=True,
                 )
-                _up_total_ins += _ins
-                _up_total_skp += _skp
-                _up_results.append((_uf.name, _ins, _skp, None))
-            except Exception as _e:
-                try:
-                    _os_up.unlink(_tmp_path)
-                except OSError:
-                    pass
-                _up_results.append((_uf.name, 0, 0, str(_e)))
 
-        st.markdown("---")
-        st.markdown("#### Results")
-        for _fname, _ins, _skp, _err in _up_results:
-            if _err:
-                st.markdown(f"""
-<div style="background:#FFF5F5; border-left:4px solid #E53E3E;
-     border-radius:6px; padding:10px 16px; margin:5px 0; font-size:13px; color:#742A2A;">
-    ❌ <b>{_fname}</b> — Error: {_err}
-</div>""", unsafe_allow_html=True)
+            if _ins > 0:
+                # Derive date range and FY from inserted rows
+                import sqlite3 as _sq3
+                _conn2 = _sq3.connect(DATABASE_FILE)
+                _dr = _conn2.execute("""
+                    SELECT MIN(date), MAX(date), financial_year
+                    FROM transactions
+                    WHERE source_file=? AND entity=? AND bank=?
+                    ORDER BY loaded_at DESC LIMIT 1
+                """, [_uploaded_file.name, _up_entity, _up_account]).fetchone()
+                _conn2.close()
+                _d_from = _dr[0] if _dr else ""
+                _d_to   = _dr[1] if _dr else ""
+                _fy     = _dr[2] if _dr else ""
+                log_upload(
+                    filename=_uploaded_file.name,
+                    entity=_up_entity,
+                    bank=_up_account,
+                    financial_year=_fy,
+                    rows_inserted=_ins,
+                    date_from=_d_from,
+                    date_to=_d_to,
+                )
+                st.session_state["last_process_result"] = {
+                    "status": "success", "filename": _uploaded_file.name,
+                    "inserted": _ins, "skipped": _skp,
+                    "entity": _up_entity, "bank": _up_account,
+                }
+            elif _skp > 0:
+                st.session_state["last_process_result"] = {
+                    "status": "already_loaded", "filename": _uploaded_file.name,
+                    "skipped": _skp,
+                }
             else:
-                st.markdown(f"""
-<div style="background:#F0FFF4; border-left:4px solid #38A169;
-     border-radius:6px; padding:10px 16px; margin:5px 0; font-size:13px; color:#276749;">
-    ✅ <b>{_fname}</b> — Inserted: <b>{_ins}</b> &nbsp;|&nbsp; Skipped duplicates: <b>{_skp}</b>
-</div>""", unsafe_allow_html=True)
+                st.session_state["last_process_result"] = {
+                    "status": "error", "filename": _uploaded_file.name,
+                    "message": "No rows processed. Check file format.",
+                }
+        except Exception as _e:
+            if _tmp_path and _os_up.path.exists(_tmp_path):
+                try: _os_up.unlink(_tmp_path)
+                except OSError: pass
+            st.session_state["last_process_result"] = {
+                "status": "error", "filename": _uploaded_file.name,
+                "message": str(_e),
+            }
 
-        if len(_up_files) > 1:
-            st.markdown(f"""
-<div style="background:#EBF4FF; border-left:4px solid #3B82F6;
-     border-radius:6px; padding:10px 16px; margin-top:8px; font-size:13px; color:#1E40AF;">
-    <b>Total — Inserted: {_up_total_ins} &nbsp;|&nbsp; Skipped: {_up_total_skp}</b>
-</div>""", unsafe_allow_html=True)
-
-        if _up_total_ins > 0:
-            st.cache_data.clear()
-            st.success("Cache cleared — refresh any tab to see updated data.")
+        st.session_state["uploader_key"] += 1
+        st.cache_data.clear()
+        st.rerun()
 
     # ── DB Restore ────────────────────────────────────────────────────────────
     st.markdown("---")

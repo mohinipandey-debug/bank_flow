@@ -146,6 +146,31 @@ def init_db():
         """, default_schemes)
     conn.commit()
 
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS cash_register (
+            id         INTEGER PRIMARY KEY AUTOINCREMENT,
+            value      REAL    NOT NULL DEFAULT 0,
+            updated_at TEXT    DEFAULT (datetime('now','localtime'))
+        )
+    """)
+    conn.commit()
+
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS upload_trail (
+            id             INTEGER PRIMARY KEY AUTOINCREMENT,
+            filename       TEXT NOT NULL,
+            entity         TEXT,
+            bank           TEXT,
+            financial_year TEXT,
+            rows_inserted  INTEGER DEFAULT 0,
+            date_from      TEXT,
+            date_to        TEXT,
+            uploaded_at    TEXT DEFAULT (datetime('now','localtime')),
+            deleted        INTEGER DEFAULT 0
+        )
+    """)
+    conn.commit()
+
     conn.close()
     print("[DB] Database initialized.")
 
@@ -232,6 +257,70 @@ def mark_file_processed(filepath, entity, bank, row_count):
         conn.commit()
     finally:
         conn.close()
+
+
+def log_upload(filename, entity, bank, financial_year,
+               rows_inserted, date_from, date_to):
+    conn = get_connection()
+    conn.execute("""
+        INSERT INTO upload_trail
+        (filename, entity, bank, financial_year,
+         rows_inserted, date_from, date_to)
+        VALUES (?,?,?,?,?,?,?)
+    """, [filename, entity, bank, financial_year,
+          rows_inserted, date_from, date_to])
+    conn.commit()
+    trail_id = conn.execute(
+        "SELECT last_insert_rowid()").fetchone()[0]
+    conn.close()
+    return trail_id
+
+
+def get_upload_trail():
+    conn = get_connection()
+    rows = conn.execute("""
+        SELECT id, filename, entity, bank, financial_year,
+               rows_inserted, date_from, date_to,
+               uploaded_at, deleted
+        FROM upload_trail
+        WHERE deleted = 0
+        ORDER BY uploaded_at DESC
+    """).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+def delete_upload(trail_id):
+    """
+    Deletes all transactions from a specific upload.
+    Matches by source_file, entity, bank, and date range.
+    Marks trail record as deleted.
+    Returns count of deleted rows.
+    """
+    conn = get_connection()
+    trail = conn.execute(
+        "SELECT * FROM upload_trail WHERE id=?",
+        [trail_id]).fetchone()
+    if not trail:
+        conn.close()
+        return 0
+    trail = dict(trail)
+    result = conn.execute("""
+        DELETE FROM transactions
+        WHERE source_file = ?
+        AND entity = ?
+        AND bank = ?
+        AND date BETWEEN ? AND ?
+        AND COALESCE(manually_overridden, 0) = 0
+    """, [trail["filename"], trail["entity"], trail["bank"],
+          trail["date_from"], trail["date_to"]])
+    deleted_rows = result.rowcount
+    conn.execute(
+        "UPDATE upload_trail SET deleted=1 WHERE id=?",
+        [trail_id])
+    conn.commit()
+    conn.close()
+    return deleted_rows
 
 
 def get_all_transactions(entity=None, bank=None, month=None, category=None,
@@ -632,6 +721,33 @@ def get_closing_balance(entity=None, bank=None, month=None, financial_year=None,
             seen_banks.add(bk)
             by_bank[bk] = r["balance"]
             dates[bk]   = r["date"]
+
+    # Fallback: banks with NO transactions (e.g. SBI-0211 with only an OB row)
+    # use their OPENING BALANCE row balance as closing balance
+    ob_params = []
+    ob_where  = "WHERE final_group = 'OPENING BALANCE'"
+    if entity and entity != "All":
+        ob_where += " AND entity=?"; ob_params.append(entity)
+    if bank and bank != "All":
+        ob_where += " AND bank=?"; ob_params.append(bank)
+    if financial_year and financial_year != "All":
+        ob_where += " AND financial_year=?"; ob_params.append(financial_year)
+
+    all_banks = conn.execute(f"""
+        SELECT DISTINCT bank FROM transactions {ob_where}
+    """, ob_params).fetchall()
+
+    for b in all_banks:
+        bk = b["bank"]
+        if bk not in by_bank:
+            ob = conn.execute("""
+                SELECT balance FROM transactions
+                WHERE bank=? AND final_group='OPENING BALANCE'
+                ORDER BY date DESC LIMIT 1
+            """, [bk]).fetchone()
+            if ob and ob["balance"] is not None:
+                by_bank[bk] = ob["balance"]
+                dates[bk]   = None
 
     total = sum(v for v in by_bank.values() if v is not None)
     conn.close()
@@ -1092,6 +1208,93 @@ def get_weekly_cash_position(weeks=12):
     """, [weeks]).fetchall()
     conn.close()
     return [dict(r) for r in reversed(rows)]
+
+
+ACCOUNT_META = {
+    "AXIS-8218": {"bank": "AXIS", "purpose": "OD (30CR)",          "entity": "Stores"},
+    "AXIS-7647": {"bank": "AXIS", "purpose": "CC Receiving",        "entity": "Stores"},
+    "HDFC-5881": {"bank": "HDFC", "purpose": "Current Account",     "entity": "Stores"},
+    "AXIS-5623": {"bank": "AXIS", "purpose": "CC",                  "entity": "Ventures"},
+    "HDFC-7862": {"bank": "HDFC", "purpose": "EMI",                 "entity": "Ventures"},
+    "HDFC-7640": {"bank": "HDFC", "purpose": "Current Account",     "entity": "Ventures"},
+    "SBI-0211":  {"bank": "SBI",  "purpose": "Statutory Payments",  "entity": "Ventures"},
+}
+
+
+def get_account_balances(financial_year=None):
+    """
+    Per-account closing balance for the Account Balance Summary table.
+    Returns list of dicts: bank_id, bank, purpose, entity, acc_no, balance.
+    """
+    conn = get_connection()
+
+    rows = []
+    for bank_id, meta in ACCOUNT_META.items():
+        params = [bank_id, bank_id]
+        fy_clause = ""
+        if financial_year and financial_year != "All":
+            fy_clause = "AND financial_year = ?"
+            params.insert(0, financial_year)
+            params.insert(3, financial_year)  # second occurrence after bank_id
+
+        # Rebuild cleanly to keep param order correct
+        fy_filter = f"AND financial_year = ?" if (financial_year and financial_year != "All") else ""
+        fy_params = [financial_year] if (financial_year and financial_year != "All") else []
+
+        # Try normal closing balance (last balance from non-OB transactions)
+        tx_row = conn.execute(f"""
+            SELECT balance FROM transactions
+            WHERE bank = ?
+              {fy_filter}
+              AND final_group != 'OPENING BALANCE'
+            ORDER BY date DESC, rowid DESC
+            LIMIT 1
+        """, [bank_id] + fy_params).fetchone()
+
+        if tx_row and tx_row["balance"] is not None:
+            balance = tx_row["balance"]
+        else:
+            # OB fallback for accounts with no transactions (e.g. SBI-0211)
+            ob_row = conn.execute(f"""
+                SELECT balance FROM transactions
+                WHERE bank = ?
+                  {fy_filter}
+                  AND final_group = 'OPENING BALANCE'
+                ORDER BY date DESC LIMIT 1
+            """, [bank_id] + fy_params).fetchone()
+            balance = ob_row["balance"] if (ob_row and ob_row["balance"] is not None) else 0.0
+
+        rows.append({
+            "bank_id": bank_id,
+            "bank":    meta["bank"],
+            "purpose": meta["purpose"],
+            "entity":  meta["entity"],
+            "acc_no":  bank_id.split("-")[1] if "-" in bank_id else bank_id,
+            "balance": round(balance, 2),
+        })
+
+    conn.close()
+    return rows
+
+
+def get_cash_at_stores():
+    """Return current Cash at Stores value (0.0 if never set)."""
+    conn = get_connection()
+    row = conn.execute(
+        "SELECT value FROM cash_register ORDER BY id DESC LIMIT 1"
+    ).fetchone()
+    conn.close()
+    return row["value"] if row else 0.0
+
+
+def set_cash_at_stores(value: float):
+    """Insert a new Cash at Stores entry (keeps history)."""
+    conn = get_connection()
+    conn.execute(
+        "INSERT INTO cash_register (value) VALUES (?)", [round(float(value), 2)]
+    )
+    conn.commit()
+    conn.close()
 
 
 if __name__ == "__main__":
