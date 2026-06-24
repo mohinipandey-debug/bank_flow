@@ -20,6 +20,8 @@ from database import (
     get_account_balances, get_cash_at_stores, set_cash_at_stores,
     get_investment_transactions, tag_investment_transaction,
     get_investment_movements,
+    add_manual_investment, get_manual_investments,
+    delete_manual_investment, get_manual_investment_totals,
 )
 from config import ENTITIES, LARGE_DEBIT_THRESHOLD, DATABASE_FILE
 
@@ -1713,7 +1715,9 @@ _cash_at_stores  = get_cash_at_stores()
 _inv_hdr         = _cached_inv_header_totals()
 _fd_total_hdr    = _inv_hdr["fd"]
 _mf_total_hdr    = _inv_hdr["mf"]
-_total_cash_pos  = closing_balance + _cash_at_stores + _fd_total_hdr + _mf_total_hdr
+_manual_totals   = get_manual_investment_totals()
+_manual_inv_net  = sum((t["invested"] or 0) - (t["redeemed"] or 0) for t in _manual_totals)
+_total_cash_pos  = closing_balance + _cash_at_stores + _fd_total_hdr + _mf_total_hdr + _manual_inv_net
 
 # ─── Transaction count (lightweight SQL COUNT — no row loading) ───────────────
 txn_count = _cached_count(sel_entity, sel_bank, sel_month, None)
@@ -1820,7 +1824,7 @@ st.markdown(f"""
         <div class="kpi-strip-hero">
             <div class="kpi-strip-label">TOTAL CASH POSITION</div>
             <div style="font-size:36px;font-weight:800;color:#FFFFFF;letter-spacing:-1.2px;line-height:1;margin-bottom:3px;">{fmt_cr(_total_cash_pos)}</div>
-            <div class="kpi-strip-sub kpi-neutral">Bank {fmt_cr(closing_balance)} · Stores {fmt_cr(_cash_at_stores)} · FD {fmt_cr(_fd_total_hdr)} · MF {fmt_cr(_mf_total_hdr)}</div>
+            <div class="kpi-strip-sub kpi-neutral">Bank {fmt_cr(closing_balance)} · Stores {fmt_cr(_cash_at_stores)} · FD {fmt_cr(_fd_total_hdr)} · MF {fmt_cr(_mf_total_hdr)} · Manual {fmt_cr(_manual_inv_net)}</div>
         </div>
         <div class="kpi-strip-item">
             <div class="kpi-strip-label">TOTAL RECEIPTS</div>
@@ -1978,7 +1982,7 @@ if selected_tab == "Summary":
         )
 
     _bank_subtotal = sum(r["balance"] for r in _acct_balances)
-    _grand_total   = _bank_subtotal + _cash_at_stores + _fd_total_hdr + _mf_total_hdr
+    _grand_total   = _bank_subtotal + _cash_at_stores + _fd_total_hdr + _mf_total_hdr + _manual_inv_net
 
     _abs_rows_html += (
         f'<tr class="abs-subtotal">'
@@ -1992,6 +1996,10 @@ if selected_tab == "Summary":
         f'<tr class="abs-subtotal">'
         f'<td colspan="4">Mutual Funds (MF)</td>'
         f'<td class="abs-bal">₹{_mf_total_hdr:,.0f}</td>'
+        f'</tr>'
+        f'<tr class="abs-subtotal">'
+        f'<td colspan="4">Manual Investments (Net)</td>'
+        f'<td class="abs-bal">₹{_manual_inv_net:,.0f}</td>'
         f'</tr>'
         f'<tr class="abs-total">'
         f'<td colspan="4">TOTAL CASH POSITION</td>'
@@ -3830,45 +3838,94 @@ elif selected_tab == "Investments":
     st.markdown('<div class="section-header" style="margin-bottom:10px;">Investment Portfolio</div>',
                 unsafe_allow_html=True)
 
-    inv_movements = get_investment_movements(entity=entity_filter)
-    register_map  = {r["scheme_name"]: r for r in inv_data}
+    inv_movements  = get_investment_movements(entity=entity_filter)
+    inv_register   = get_investment_register()
+    manual_totals  = get_manual_investment_totals()
+    register_map   = {r["scheme_name"]: r for r in inv_register}
 
     _rows_display = []
     _seen_schemes = set()
+
+    # Rows from bank transactions tagged with main_group=INVESTMENT
     for _mov in inv_movements:
         _sn = _mov["scheme_name"]
         _seen_schemes.add(_sn)
         _reg     = register_map.get(_sn, {})
         _opening = _reg.get("opening_value", 0) or 0
-        _current = _opening + _mov["invested"] - _mov["redeemed"]
+        _current = _opening + (_mov["invested"] or 0) - (_mov["redeemed"] or 0)
         _rows_display.append({
             "Scheme":        _sn,
             "Number":        _mov["scheme_number"],
             "Type":          _mov["scheme_type"],
             "Entity":        _mov["entity"],
-            "Opening (Rs)":  fmt_inr(_opening),
-            "Invested (Rs)": fmt_inr(_mov["invested"]) if _mov["invested"] else "—",
-            "Redeemed (Rs)": fmt_inr(_mov["redeemed"]) if _mov["redeemed"] else "—",
-            "Current (Rs)":  fmt_inr(_current),
+            "Source":        "Bank Txn",
+            "Opening (₹)":  fmt_inr(_opening),
+            "Invested (₹)": fmt_inr(_mov["invested"]) if _mov["invested"] else "—",
+            "Redeemed (₹)": fmt_inr(_mov["redeemed"]) if _mov["redeemed"] else "—",
+            "Current (₹)":  fmt_inr(_current),
             "Txns":          _mov["txn_count"],
         })
-    for _r in inv_data:
+
+    # Rows from manual entries (off-statement FD/MF)
+    for _mt in manual_totals:
+        _sn = _mt["scheme_name"]
+        _seen_schemes.add(_sn)
+        _reg      = register_map.get(_sn, {})
+        _opening  = _reg.get("opening_value", 0) or 0
+        _invested = _mt["invested"]  or 0
+        _redeemed = _mt["redeemed"]  or 0
+        _current  = _opening + _invested - _redeemed
+        _rows_display.append({
+            "Scheme":        _sn,
+            "Number":        "—",
+            "Type":          _mt["scheme_type"],
+            "Entity":        _mt["entity"],
+            "Source":        "Manual",
+            "Opening (₹)":  fmt_inr(_opening),
+            "Invested (₹)": fmt_inr(_invested) if _invested else "—",
+            "Redeemed (₹)": fmt_inr(_redeemed) if _redeemed else "—",
+            "Current (₹)":  fmt_inr(_current),
+            "Txns":          _mt["entry_count"],
+        })
+
+    # Static register entries with no transactions and no manual entries
+    for _r in inv_register:
         if _r["scheme_name"] not in _seen_schemes:
             _rows_display.append({
                 "Scheme":        _r["scheme_name"],
                 "Number":        "—",
                 "Type":          _r["scheme_type"],
                 "Entity":        _r["entity"],
-                "Opening (Rs)":  fmt_inr(_r["opening_value"] or 0),
-                "Invested (Rs)": "—",
-                "Redeemed (Rs)": "—",
-                "Current (Rs)":  fmt_inr(_r["opening_value"] or 0),
+                "Source":        "Register",
+                "Opening (₹)":  fmt_inr(_r["opening_value"] or 0),
+                "Invested (₹)": "—",
+                "Redeemed (₹)": "—",
+                "Current (₹)":  fmt_inr(_r["opening_value"] or 0),
                 "Txns":          0,
             })
 
     if _rows_display:
         _df_inv_portfolio = pd.DataFrame(_rows_display)
         st.dataframe(_df_inv_portfolio, use_container_width=True, hide_index=True)
+
+        # Total row
+        _total_current = 0.0
+        for _row in _rows_display:
+            _cv = _row.get("Current (₹)", "")
+            if _cv and _cv not in ("—", ""):
+                try:
+                    _total_current += float(
+                        str(_cv).replace("₹", "").replace(",", "").strip()
+                    )
+                except Exception:
+                    pass
+        st.markdown(f"""
+<div style="background:#1B2B4B;color:#FFFFFF;border-radius:8px;
+     padding:12px 20px;display:flex;justify-content:space-between;
+     margin-top:8px;">
+    <b>TOTAL INVESTMENT VALUE</b>
+    <b>{fmt_inr(_total_current)}</b>
+</div>""", unsafe_allow_html=True)
     else:
         st.info("No investment data found.")
 
@@ -3957,6 +4014,110 @@ elif selected_tab == "Investments":
                 delete_investment_scheme(_del_scheme)
                 st.success(f"Removed {_del_scheme}")
                 st.rerun()
+
+    # ── Manual FD/MF Entry ────────────────────────────────────────────────────
+    st.markdown("---")
+    st.markdown("#### Add Manual FD / MF Entry")
+    st.caption("Add investments or redemptions not captured in bank statements.")
+
+    with st.form("manual_inv_form", clear_on_submit=True):
+        _mf1, _mf2, _mf3 = st.columns(3)
+        with _mf1:
+            _mi_date = st.date_input(
+                "Date", value=datetime.date.today(),
+                key="mi_date", format="DD/MM/YYYY")
+            _mi_type = st.selectbox("Type (FD/MF)", ["FD", "MF"], key="mi_type")
+        with _mf2:
+            _mi_scheme = st.text_input(
+                "Scheme Name",
+                placeholder="e.g. SBI FD, HDFC Flexi Cap",
+                key="mi_scheme")
+            _mi_entity = st.selectbox(
+                "Entity", ["Stores", "Ventures"], key="mi_entity")
+        with _mf3:
+            _mi_amount = st.number_input(
+                "Amount (₹)", min_value=0.0, step=10000.0, key="mi_amount")
+            _mi_entry_type = st.selectbox(
+                "Invested / Redeemed", ["Invested", "Redeemed"],
+                key="mi_entry_type")
+
+        _mi_notes = st.text_input(
+            "Notes (optional)",
+            placeholder="Maturity date, interest rate etc.",
+            key="mi_notes")
+
+        if st.form_submit_button("Save Entry"):
+            if not _mi_scheme.strip():
+                st.error("Scheme Name is required.")
+            elif _mi_amount <= 0:
+                st.error("Amount must be greater than 0.")
+            else:
+                add_manual_investment(
+                    entry_date  = str(_mi_date),
+                    scheme_name = _mi_scheme.strip(),
+                    scheme_type = _mi_type,
+                    amount      = _mi_amount,
+                    entry_type  = _mi_entry_type,
+                    entity      = _mi_entity,
+                    notes       = _mi_notes.strip(),
+                )
+                st.success(
+                    f"{_mi_entry_type} {fmt_inr(_mi_amount)} in "
+                    f"{_mi_scheme} ({_mi_type}) saved.")
+                st.cache_data.clear()
+                st.rerun()
+
+    st.markdown("#### Manual Entry History")
+    _manual_entries = get_manual_investments()
+    if not _manual_entries:
+        st.info("No manual entries yet.")
+    else:
+        for _me in _manual_entries:
+            _me_color = "#16A34A" if _me["entry_type"] == "Invested" else "#DC2626"
+            _me_cols  = st.columns([1.5, 2.5, 1, 1, 2, 1.5, 0.6])
+            for _col, _val in zip(_me_cols[:6], [
+                _me["entry_date"],
+                _me["scheme_name"],
+                _me["scheme_type"],
+                _me["entity"],
+                f'<b style="color:{_me_color};">'
+                f'{_me["entry_type"]}: {fmt_inr(_me["amount"])}</b>',
+                _me["notes"] or "—",
+            ]):
+                with _col:
+                    st.markdown(
+                        f'<div style="font-size:12px;padding:4px 0;">{_val}</div>',
+                        unsafe_allow_html=True)
+            with _me_cols[6]:
+                if st.button("🗑️", key=f"del_mi_{_me['id']}",
+                             help="Delete this entry"):
+                    delete_manual_investment(_me["id"])
+                    st.cache_data.clear()
+                    st.rerun()
+
+        st.markdown("---")
+        st.markdown("#### Manual Entry Summary by Scheme")
+        _mi_totals = get_manual_investment_totals()
+        for _mt in _mi_totals:
+            _mt_net   = (_mt["invested"] or 0) - (_mt["redeemed"] or 0)
+            _mt_color = "#16A34A" if _mt_net >= 0 else "#DC2626"
+            st.markdown(f"""
+<div style="background:#FFFFFF;border-radius:8px;padding:12px 16px;
+     border:1px solid #E8ECF0;margin:6px 0;
+     display:flex;justify-content:space-between;align-items:center;">
+    <div>
+        <b style="font-size:13px;">{_mt['scheme_name']}</b>
+        <span style="font-size:11px;color:#8896A5;margin-left:8px;">
+            {_mt['scheme_type']} · {_mt['entity']}
+        </span>
+    </div>
+    <div style="text-align:right;">
+        <span style="font-size:12px;color:#4A5568;">
+            Invested: {fmt_inr(_mt['invested'])} | Redeemed: {fmt_inr(_mt['redeemed'])}
+        </span><br>
+        <b style="font-size:13px;color:{_mt_color};">Net: {fmt_inr(_mt_net)}</b>
+    </div>
+</div>""", unsafe_allow_html=True)
 
     # ── B5: Transaction tagging ───────────────────────────────────────────────
     st.markdown("---")

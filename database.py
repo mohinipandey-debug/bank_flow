@@ -172,6 +172,22 @@ def init_db():
     """)
     conn.commit()
 
+    # manual_investments — off-statement FD/MF entries
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS manual_investments (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            entry_date  TEXT NOT NULL,
+            scheme_name TEXT NOT NULL,
+            scheme_type TEXT NOT NULL,
+            amount      REAL NOT NULL,
+            entry_type  TEXT NOT NULL,
+            entity      TEXT DEFAULT 'Ventures',
+            notes       TEXT,
+            created_at  TEXT DEFAULT (datetime('now','localtime'))
+        )
+    """)
+    conn.commit()
+
     # A2 — Investment transaction tagging
     conn.execute("""
         CREATE TABLE IF NOT EXISTS investment_txn_mapping (
@@ -1423,6 +1439,53 @@ def get_tab_summary_cached(entity, bank, month, financial_year):
         "total_payouts":  r["total_dr"] or 0,
         "txn_count":      r["txn_count"] or 0,
     }
+
+
+def add_manual_investment(entry_date, scheme_name, scheme_type,
+                          amount, entry_type, entity, notes=""):
+    conn = get_connection()
+    conn.execute("""
+        INSERT INTO manual_investments
+        (entry_date, scheme_name, scheme_type, amount, entry_type, entity, notes)
+        VALUES (?,?,?,?,?,?,?)
+    """, [entry_date, scheme_name, scheme_type, amount, entry_type, entity, notes])
+    conn.commit()
+    conn.close()
+
+
+def get_manual_investments():
+    conn = get_connection()
+    rows = conn.execute("""
+        SELECT * FROM manual_investments ORDER BY entry_date DESC
+    """).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+def delete_manual_investment(entry_id):
+    conn = get_connection()
+    conn.execute("DELETE FROM manual_investments WHERE id=?", [entry_id])
+    conn.commit()
+    conn.close()
+
+
+def get_manual_investment_totals():
+    """Per-scheme net totals from manual entries (not in bank statements)."""
+    conn = get_connection()
+    rows = conn.execute("""
+        SELECT
+            scheme_name,
+            scheme_type,
+            entity,
+            ROUND(SUM(CASE WHEN entry_type='Invested' THEN amount ELSE 0 END), 2) as invested,
+            ROUND(SUM(CASE WHEN entry_type='Redeemed' THEN amount ELSE 0 END), 2) as redeemed,
+            COUNT(*) as entry_count
+        FROM manual_investments
+        GROUP BY scheme_name, scheme_type, entity
+        ORDER BY scheme_type, scheme_name
+    """).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
 
 
 if __name__ == "__main__":
