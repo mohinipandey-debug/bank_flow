@@ -2,6 +2,7 @@ import sqlite3
 import hashlib
 import os
 import datetime
+import functools
 from config import DATABASE_FILE
 
 
@@ -169,6 +170,57 @@ def init_db():
             deleted        INTEGER DEFAULT 0
         )
     """)
+    conn.commit()
+
+    # A2 — Investment transaction tagging
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS investment_txn_mapping (
+            id              INTEGER PRIMARY KEY AUTOINCREMENT,
+            transaction_id  INTEGER NOT NULL UNIQUE,
+            scheme_name     TEXT,
+            scheme_number   TEXT,
+            scheme_type     TEXT,
+            notes           TEXT,
+            tagged_at       TEXT DEFAULT (datetime('now','localtime')),
+            FOREIGN KEY (transaction_id) REFERENCES transactions(id)
+        )
+    """)
+    conn.commit()
+
+    # A1 — One-time: protect all FY2526 imported rows from keyword reload
+    already_done = conn.execute("""
+        SELECT COUNT(*) FROM transactions
+        WHERE financial_year='FY2526'
+        AND manually_overridden=1
+        AND source_file NOT IN ('manual_entry','ob_fix')
+    """).fetchone()[0]
+
+    if already_done == 0:
+        result = conn.execute("""
+            UPDATE transactions
+            SET manually_overridden=1
+            WHERE financial_year='FY2526'
+            AND COALESCE(manually_overridden,0)=0
+            AND final_group != 'OPENING BALANCE'
+        """)
+        conn.commit()
+        if result.rowcount:
+            print(f"[DB] Protected {result.rowcount:,} FY2526 rows from reload")
+
+    # A4 — Compound indexes for common filter patterns
+    _indexes = [
+        "CREATE INDEX IF NOT EXISTS idx_main_group  ON transactions(main_group)",
+        "CREATE INDEX IF NOT EXISTS idx_fy_fg       ON transactions(financial_year, final_group)",
+        "CREATE INDEX IF NOT EXISTS idx_fy_entity   ON transactions(financial_year, entity)",
+        "CREATE INDEX IF NOT EXISTS idx_fy_bank     ON transactions(financial_year, bank)",
+        "CREATE INDEX IF NOT EXISTS idx_fy_date     ON transactions(financial_year, date)",
+        "CREATE INDEX IF NOT EXISTS idx_mo_override ON transactions(manually_overridden)",
+    ]
+    for _sql in _indexes:
+        try:
+            conn.execute(_sql)
+        except Exception:
+            pass
     conn.commit()
 
     conn.close()
@@ -821,7 +873,8 @@ def reload_categories():
 
     conn = get_connection()
 
-    # Step 2: Reset every transaction except OPENING BALANCE and manually overridden rows
+    # Step 2: Reset only non-manual, non-FY2526-protected rows
+    # manually_overridden=1 covers: FY2526 imported rows, manual overrides, OB rows
     conn.execute("""
         UPDATE transactions
         SET category      = 'Uncategorized',
@@ -1010,43 +1063,85 @@ def delete_investment_scheme(scheme_name):
     conn.close()
 
 
-def get_investment_transactions(scheme_name=None, entity=None,
-                                date_from=None, date_to=None):
+def get_investment_transactions(date_from=None, date_to=None, entity=None):
     """
-    Get investment transactions from the transactions table.
-    Investments = main_group = 'INVESTMENT'.
-    Debit = new investment (money going in).
-    Credit = redemption (money coming back).
+    Get all transactions with main_group='INVESTMENT'.
+    LEFT JOINs investment_txn_mapping for scheme tagging details.
+    Returns individual rows (not aggregated) for the tagging UI.
     """
-    conn = get_connection()
-
-    filters = "WHERE main_group = 'INVESTMENT'"
-    params  = []
-
-    if scheme_name:
-        filters += " AND final_group = ?"
-        params.append(scheme_name)
-    if entity and entity != "All":
-        filters += " AND entity = ?"
-        params.append(entity)
+    conn   = get_connection()
+    where  = "WHERE UPPER(t.main_group)='INVESTMENT'"
+    params = []
     if date_from:
-        filters += " AND date >= ?"
-        params.append(date_from)
+        where += " AND t.date >= ?"; params.append(date_from)
     if date_to:
-        filters += " AND date <= ?"
-        params.append(date_to)
+        where += " AND t.date <= ?"; params.append(date_to)
+    if entity and entity != "All":
+        where += " AND t.entity = ?"; params.append(entity)
 
     rows = conn.execute(f"""
-        SELECT final_group as scheme_name,
-               SUM(debit)  as total_invested,
-               SUM(credit) as total_redeemed,
-               COUNT(*)    as txn_count
-        FROM transactions
-        {filters}
-        GROUP BY final_group
-        ORDER BY final_group
+        SELECT t.id, t.date, t.entity, t.bank,
+               t.narration, t.debit, t.credit,
+               t.final_group, t.financial_year,
+               COALESCE(m.scheme_name,   '') as scheme_name,
+               COALESCE(m.scheme_number, '') as scheme_number,
+               COALESCE(m.scheme_type,   '') as scheme_type,
+               COALESCE(m.notes,         '') as notes
+        FROM transactions t
+        LEFT JOIN investment_txn_mapping m ON t.id = m.transaction_id
+        {where}
+        ORDER BY t.date DESC
     """, params).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
 
+
+def tag_investment_transaction(transaction_id, scheme_name,
+                               scheme_number, scheme_type, notes=""):
+    """Tag or update a transaction with investment scheme details."""
+    conn = get_connection()
+    conn.execute("""
+        INSERT INTO investment_txn_mapping
+            (transaction_id, scheme_name, scheme_number, scheme_type, notes)
+        VALUES (?,?,?,?,?)
+        ON CONFLICT(transaction_id) DO UPDATE SET
+            scheme_name   = excluded.scheme_name,
+            scheme_number = excluded.scheme_number,
+            scheme_type   = excluded.scheme_type,
+            notes         = excluded.notes,
+            tagged_at     = datetime('now','localtime')
+    """, [transaction_id, scheme_name, scheme_number, scheme_type, notes])
+    conn.commit()
+    conn.close()
+
+
+def get_investment_movements(entity=None):
+    """
+    Aggregates investment transactions by scheme (via tagging).
+    Returns per-scheme invested/redeemed totals.
+    Untagged transactions are grouped under 'Untagged'.
+    """
+    conn   = get_connection()
+    where  = "WHERE UPPER(t.main_group)='INVESTMENT'"
+    params = []
+    if entity and entity != "All":
+        where += " AND t.entity=?"; params.append(entity)
+
+    rows = conn.execute(f"""
+        SELECT
+            COALESCE(NULLIF(m.scheme_name,   ''), 'Untagged') as scheme_name,
+            COALESCE(NULLIF(m.scheme_number, ''), '—')        as scheme_number,
+            COALESCE(NULLIF(m.scheme_type,   ''), '?')        as scheme_type,
+            t.entity,
+            ROUND(SUM(CASE WHEN t.debit  > 0 THEN t.debit  ELSE 0 END), 2) as invested,
+            ROUND(SUM(CASE WHEN t.credit > 0 THEN t.credit ELSE 0 END), 2) as redeemed,
+            COUNT(*) as txn_count
+        FROM transactions t
+        LEFT JOIN investment_txn_mapping m ON t.id = m.transaction_id
+        {where}
+        GROUP BY scheme_name, scheme_number, scheme_type, t.entity
+        ORDER BY invested DESC
+    """, params).fetchall()
     conn.close()
     return [dict(r) for r in rows]
 
@@ -1295,6 +1390,39 @@ def set_cash_at_stores(value: float):
     )
     conn.commit()
     conn.close()
+
+
+@functools.lru_cache(maxsize=32)
+def get_tab_summary_cached(entity, bank, month, financial_year):
+    """
+    Lightweight summary for header band only.
+    Uses SQL aggregates — never loads all rows into memory.
+    """
+    conn   = get_connection()
+    where  = "WHERE final_group != 'OPENING BALANCE'"
+    params = []
+    if entity and entity != "All":
+        where += " AND entity=?";        params.append(entity)
+    if bank and bank != "All":
+        where += " AND bank=?";          params.append(bank)
+    if month and month != "All":
+        where += " AND strftime('%Y-%m',date)=?"; params.append(month)
+    if financial_year and financial_year != "All":
+        where += " AND financial_year=?"; params.append(financial_year)
+
+    r = conn.execute(f"""
+        SELECT
+            ROUND(SUM(CASE WHEN credit > 0 THEN credit ELSE 0 END), 2) as total_cr,
+            ROUND(SUM(CASE WHEN debit  > 0 THEN debit  ELSE 0 END), 2) as total_dr,
+            COUNT(*) as txn_count
+        FROM transactions {where}
+    """, params).fetchone()
+    conn.close()
+    return {
+        "total_receipts": r["total_cr"] or 0,
+        "total_payouts":  r["total_dr"] or 0,
+        "txn_count":      r["txn_count"] or 0,
+    }
 
 
 if __name__ == "__main__":

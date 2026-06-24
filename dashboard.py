@@ -18,6 +18,8 @@ from database import (
     get_yoy_comparison, get_top_expenses_comparison, get_weekly_cash_position,
     log_upload, get_upload_trail, delete_upload,
     get_account_balances, get_cash_at_stores, set_cash_at_stores,
+    get_investment_transactions, tag_investment_transaction,
+    get_investment_movements,
 )
 from config import ENTITIES, LARGE_DEBIT_THRESHOLD, DATABASE_FILE
 
@@ -35,8 +37,8 @@ FY_BOUNDS  = {
 }
 from utils.formatters import fmt_inr, _inr, _td, _td_dash
 
-# ── Cached DB wrappers (ttl=120s) ─────────────────────────────────────────────
-@st.cache_data(ttl=120)
+# ── Cached DB wrappers ────────────────────────────────────────────────────────
+@st.cache_data(ttl=300)
 def _cached_summary(entity, month, financial_year):
     return get_summary(
         entity=entity if entity != "All" else None,
@@ -44,15 +46,15 @@ def _cached_summary(entity, month, financial_year):
         financial_year=financial_year,
     )
 
-@st.cache_data(ttl=120)
+@st.cache_data(ttl=600)
 def _cached_months(financial_year):
     return get_available_months(financial_year=financial_year)
 
-@st.cache_data(ttl=120)
+@st.cache_data(ttl=300)
 def _cached_uncategorized(financial_year):
     return get_uncategorized(financial_year=financial_year)
 
-@st.cache_data(ttl=120)
+@st.cache_data(ttl=300)
 def _cached_count(entity, bank, month, financial_year):
     return get_transaction_count(
         entity=entity if entity != "All" else None,
@@ -61,7 +63,7 @@ def _cached_count(entity, bank, month, financial_year):
         financial_year=financial_year,
     )
 
-@st.cache_data(ttl=120)
+@st.cache_data(ttl=300)
 def _cached_closing(entity, bank, month, financial_year):
     return get_closing_balance(
         entity=entity if entity != "All" else None,
@@ -69,6 +71,15 @@ def _cached_closing(entity, bank, month, financial_year):
         month=month   if month  != "All" else None,
         financial_year=financial_year,
     )
+
+@st.cache_data(ttl=300)
+def _cached_inv_header_totals():
+    """Lightweight FD+MF totals for header band — avoids full investment query on every tab."""
+    _d = get_investment_summary()
+    return {
+        "fd": sum(r["current_value"] for r in _d if r["scheme_type"] == "FD"),
+        "mf": sum(r["current_value"] for r in _d if r["scheme_type"] == "MF"),
+    }
 from queries.cashflow_queries import fetch_cf
 from tabs.overview import render_overview
 from tabs.review_queue import render_review_queue
@@ -109,6 +120,19 @@ def fmt_cr(x):
             return f"{sign}₹{x:,.0f}"
     except Exception:
         return str(x)
+
+
+def fmt_cf(x):
+    """Cash Flow formatter — negative as (₹X,XX,XXX), positive as ₹X,XX,XXX."""
+    try:
+        x = float(x)
+        if x == 0:
+            return "—"
+        if x < 0:
+            return f"(₹{abs(x):,.0f})"
+        return f"₹{x:,.0f}"
+    except Exception:
+        return str(x) if x else "—"
 
 
 st.set_page_config(
@@ -1685,11 +1709,11 @@ else:
     _cb_sub         = "No transactions"
 
 # ─── Cash at Stores + investment totals for header TOTAL CASH POSITION ────────
-_cash_at_stores = get_cash_at_stores()
-_inv_all        = get_investment_summary()
-_fd_total_hdr   = sum(r["current_value"] for r in _inv_all if r["scheme_type"] == "FD")
-_mf_total_hdr   = sum(r["current_value"] for r in _inv_all if r["scheme_type"] == "MF")
-_total_cash_pos = closing_balance + _cash_at_stores + _fd_total_hdr + _mf_total_hdr
+_cash_at_stores  = get_cash_at_stores()
+_inv_hdr         = _cached_inv_header_totals()
+_fd_total_hdr    = _inv_hdr["fd"]
+_mf_total_hdr    = _inv_hdr["mf"]
+_total_cash_pos  = closing_balance + _cash_at_stores + _fd_total_hdr + _mf_total_hdr
 
 # ─── Transaction count (lightweight SQL COUNT — no row loading) ───────────────
 txn_count = _cached_count(sel_entity, sel_bank, sel_month, None)
@@ -2841,19 +2865,22 @@ elif selected_tab == "Exception Report":
 
     st.markdown("")
 
-    txns_all = get_all_transactions()
-    if txns_all:
-        df_all    = pd.DataFrame(txns_all)
-        transfers = df_all[df_all["main_group"].isin(["INTERBANK", "INTERCOMPANY"])]
-        if not transfers.empty:
-            inter_total = transfers["debit"].sum()
-            inter_count = len(transfers)
-            st.markdown(f"""
-            <div class="alert-box alert-green">
-                <b>ℹ️ INTERBANK / INTERCOMPANY TRANSFERS</b> — Excluded from P&amp;L<br>
-                {inter_count} transfers totalling ₹{inter_total:,.0f} are excluded
-                from inflow/outflow calculations.
-            </div>""", unsafe_allow_html=True)
+    import sqlite3 as _sq3_exc
+    _exc_conn = _sq3_exc.connect(DATABASE_FILE)
+    _exc_conn.row_factory = _sq3_exc.Row
+    _inter_row = _exc_conn.execute("""
+        SELECT COUNT(*) as cnt, ROUND(SUM(debit),2) as total
+        FROM transactions
+        WHERE main_group IN ('INTERBANK','INTERCOMPANY')
+    """).fetchone()
+    _exc_conn.close()
+    if _inter_row and _inter_row["cnt"] > 0:
+        st.markdown(f"""
+        <div class="alert-box alert-green">
+            <b>ℹ️ INTERBANK / INTERCOMPANY TRANSFERS</b> — Excluded from P&amp;L<br>
+            {_inter_row["cnt"]:,} transfers totalling ₹{(_inter_row["total"] or 0):,.0f} are excluded
+            from inflow/outflow calculations.
+        </div>""", unsafe_allow_html=True)
 
 # ══════════════════════════════════════════════════════════════════════════════
 # CASH FLOW
@@ -3109,7 +3136,7 @@ elif selected_tab == "Cash Flow":
                     st.markdown(
                         f'<div style="text-align:right; font-size:13px; color:{_rcol}; '
                         f'font-weight:600; padding:6px 0;">'
-                        f'{fmt_inr(_rval)}</div>',
+                        f'{fmt_cf(_rval)}</div>',
                         unsafe_allow_html=True)
 
         _cf_section(
@@ -3594,7 +3621,7 @@ elif selected_tab == "Cash Flow":
                 for _i, _v in enumerate(_week_vals):
                     with _rr[_i + 2]:
                         _vc = "#16A34A" if _v >= 0 else "#DC2626"
-                        _vd = fmt_inr(_v) if abs(_v) > 1 else "—"
+                        _vd = fmt_cf(_v) if abs(_v) > 1 else "—"
                         st.markdown(
                             f'<div style="text-align:right; font-size:12px; color:{_vc}; '
                             f'font-weight:600; background:{_WK_RECON_BG[_i]}; padding:6px;">'
@@ -3605,7 +3632,7 @@ elif selected_tab == "Cash Flow":
                     st.markdown(
                         f'<div style="text-align:right; font-size:12px; color:{_tc}; '
                         f'font-weight:700; background:#F0F4FF; padding:6px;">'
-                        f'{fmt_inr(_grand_total)}</div>',
+                        f'{fmt_cf(_grand_total)}</div>',
                         unsafe_allow_html=True)
 
         # ── Closing Balance ───────────────────────────────────────────────
@@ -3690,7 +3717,7 @@ elif selected_tab == "Cash Flow":
             _tdif = _w_data[_wi]["tally_diff"]
             _tok  = abs(_tdif) <= 1
             _tic  = "✅" if _tok else "⚠️"
-            _tip  = "Tallied" if _tok else fmt_inr(abs(_tdif))
+            _tip  = "Tallied" if _tok else fmt_cf(abs(_tdif))
             _tbg_t = "var(--green-50,#F0FDF4)" if _tok else "var(--amber-50,#FFFBEB)"
             with _tally_r[_wi + 2]:
                 st.markdown(
@@ -3700,7 +3727,7 @@ elif selected_tab == "Cash Flow":
         _total_tdif = round(_cb_totals[3] - _db_actual_close[3], 2)
         with _tally_r[6]:
             _gt_ok  = abs(_total_tdif) <= 1
-            _gt_tip = "Tallied" if _gt_ok else fmt_inr(abs(_total_tdif))
+            _gt_tip = "Tallied" if _gt_ok else fmt_cf(abs(_total_tdif))
             _gt_bg  = "var(--green-50,#F0FDF4)" if _gt_ok else "var(--amber-50,#FFFBEB)"
             st.markdown(
                 f'<div style="text-align:center;padding:3px 2px;background:{_gt_bg};'
@@ -3799,101 +3826,51 @@ elif selected_tab == "Investments":
             st.rerun()
     st.markdown("<br>", unsafe_allow_html=True)
 
-    # ── Investment table helper ───────────────────────────────────────────────
-    def render_investment_table(schemes):
-        if not schemes:
-            st.info("No schemes found.")
-            return
+    # ── B4: Investment Portfolio — movements from actual transactions ─────────
+    st.markdown('<div class="section-header" style="margin-bottom:10px;">Investment Portfolio</div>',
+                unsafe_allow_html=True)
 
-        _hc = st.columns([3, 2, 2, 2, 2, 1])
-        for _col, _h in zip(_hc, ["Scheme", "Opening Value",
-                                   "Invested", "Redeemed",
-                                   "Current Value", "Txns"]):
-            with _col:
-                st.markdown(
-                    f'<div style="font-size:11px;font-weight:700;color:#8896A5;'
-                    f'letter-spacing:0.06em;text-transform:uppercase;padding:4px 0;">'
-                    f'{_h}</div>', unsafe_allow_html=True)
+    inv_movements = get_investment_movements(entity=entity_filter)
+    register_map  = {r["scheme_name"]: r for r in inv_data}
 
-        st.markdown(
-            '<hr style="margin:4px 0 8px 0;border:none;border-top:1px solid #E8ECF0;">',
-            unsafe_allow_html=True)
+    _rows_display = []
+    _seen_schemes = set()
+    for _mov in inv_movements:
+        _sn = _mov["scheme_name"]
+        _seen_schemes.add(_sn)
+        _reg     = register_map.get(_sn, {})
+        _opening = _reg.get("opening_value", 0) or 0
+        _current = _opening + _mov["invested"] - _mov["redeemed"]
+        _rows_display.append({
+            "Scheme":        _sn,
+            "Number":        _mov["scheme_number"],
+            "Type":          _mov["scheme_type"],
+            "Entity":        _mov["entity"],
+            "Opening (Rs)":  fmt_inr(_opening),
+            "Invested (Rs)": fmt_inr(_mov["invested"]) if _mov["invested"] else "—",
+            "Redeemed (Rs)": fmt_inr(_mov["redeemed"]) if _mov["redeemed"] else "—",
+            "Current (Rs)":  fmt_inr(_current),
+            "Txns":          _mov["txn_count"],
+        })
+    for _r in inv_data:
+        if _r["scheme_name"] not in _seen_schemes:
+            _rows_display.append({
+                "Scheme":        _r["scheme_name"],
+                "Number":        "—",
+                "Type":          _r["scheme_type"],
+                "Entity":        _r["entity"],
+                "Opening (Rs)":  fmt_inr(_r["opening_value"] or 0),
+                "Invested (Rs)": "—",
+                "Redeemed (Rs)": "—",
+                "Current (Rs)":  fmt_inr(_r["opening_value"] or 0),
+                "Txns":          0,
+            })
 
-        _t_open = _t_inv = _t_red = _t_cur = 0
-
-        for _r in schemes:
-            _rc = st.columns([3, 2, 2, 2, 2, 1])
-            _mv = _r["current_value"] - _r["opening_value"]
-            _cc = "#16A34A" if _mv >= 0 else "#DC2626"
-
-            with _rc[0]:
-                st.markdown(
-                    f'<div style="font-size:13px;font-weight:600;color:#1A202C;padding:6px 0;">'
-                    f'{_r["scheme_name"]}'
-                    f'<span style="font-size:10px;color:#8896A5;margin-left:6px;">'
-                    f'{_r["entity"]}</span></div>', unsafe_allow_html=True)
-            with _rc[1]:
-                st.markdown(
-                    f'<div style="font-size:13px;color:#4A5568;padding:6px 0;">'
-                    f'{fmt_inr(_r["opening_value"])}</div>', unsafe_allow_html=True)
-            with _rc[2]:
-                _inv_val = fmt_inr(_r["invested"]) if _r["invested"] else "—"
-                st.markdown(
-                    f'<div style="font-size:13px;color:#1E40AF;padding:6px 0;">'
-                    f'{_inv_val}</div>', unsafe_allow_html=True)
-            with _rc[3]:
-                _red_val = fmt_inr(_r["redeemed"]) if _r["redeemed"] else "—"
-                st.markdown(
-                    f'<div style="font-size:13px;color:#9D174D;padding:6px 0;">'
-                    f'{_red_val}</div>', unsafe_allow_html=True)
-            with _rc[4]:
-                st.markdown(
-                    f'<div style="font-size:13px;font-weight:700;color:{_cc};padding:6px 0;">'
-                    f'{fmt_inr(_r["current_value"])}</div>', unsafe_allow_html=True)
-            with _rc[5]:
-                st.markdown(
-                    f'<div style="font-size:12px;color:#8896A5;padding:6px 0;">'
-                    f'{_r["txn_count"]}</div>', unsafe_allow_html=True)
-
-            _t_open += _r["opening_value"]
-            _t_inv  += _r["invested"]
-            _t_red  += _r["redeemed"]
-            _t_cur  += _r["current_value"]
-
-        st.markdown(
-            '<hr style="margin:4px 0;border:none;border-top:2px solid #E8ECF0;">',
-            unsafe_allow_html=True)
-        _tc = st.columns([3, 2, 2, 2, 2, 1])
-        _tot_mv = _t_cur - _t_open
-        _tot_cc = "#16A34A" if _tot_mv >= 0 else "#DC2626"
-        for _col, _val, _clr in [
-            (_tc[0], "TOTAL",                                 "#1A202C"),
-            (_tc[1], fmt_inr(_t_open),                       "#1A202C"),
-            (_tc[2], fmt_inr(_t_inv) if _t_inv else "—",    "#1E40AF"),
-            (_tc[3], fmt_inr(_t_red) if _t_red else "—",    "#9D174D"),
-            (_tc[4], fmt_inr(_t_cur),                        _tot_cc),
-            (_tc[5], "",                                      "#8896A5"),
-        ]:
-            with _col:
-                st.markdown(
-                    f'<div style="font-size:13px;font-weight:700;color:{_clr};padding:6px 0;">'
-                    f'{_val}</div>', unsafe_allow_html=True)
-
-    # ── Fixed Deposits ────────────────────────────────────────────────────────
-    st.markdown("""
-<div style="font-size:11px;font-weight:700;color:#8896A5;letter-spacing:0.1em;
-     text-transform:uppercase;margin-bottom:10px;">FIXED DEPOSITS</div>
-""", unsafe_allow_html=True)
-    render_investment_table(fds)
-
-    st.markdown("<br>", unsafe_allow_html=True)
-
-    # ── Mutual Funds ──────────────────────────────────────────────────────────
-    st.markdown("""
-<div style="font-size:11px;font-weight:700;color:#8896A5;letter-spacing:0.1em;
-     text-transform:uppercase;margin-bottom:10px;">MUTUAL FUNDS</div>
-""", unsafe_allow_html=True)
-    render_investment_table(mfs)
+    if _rows_display:
+        _df_inv_portfolio = pd.DataFrame(_rows_display)
+        st.dataframe(_df_inv_portfolio, use_container_width=True, hide_index=True)
+    else:
+        st.info("No investment data found.")
 
     st.markdown("<br>", unsafe_allow_html=True)
 
@@ -3981,49 +3958,74 @@ elif selected_tab == "Investments":
                 st.success(f"Removed {_del_scheme}")
                 st.rerun()
 
-    # ── Investment Transactions Detail ────────────────────────────────────────
+    # ── B5: Transaction tagging ───────────────────────────────────────────────
     st.markdown("---")
-    with st.expander("📋 Investment Transactions Detail", expanded=False):
-        st.caption(
-            "All transactions categorized under main_group = INVESTMENT "
-            "within the selected date range.")
+    st.markdown("#### Tag Investment Transactions")
+    st.caption(
+        "All transactions with Main Group = INVESTMENT. "
+        "Add scheme name and number for portfolio tracking.")
 
-        _inv_txns = get_all_transactions(entity=entity_filter, month=None)
-        if _inv_txns:
-            _df_inv = pd.DataFrame(_inv_txns)
-            _df_inv = _df_inv[
-                _df_inv["main_group"].str.upper().str.strip() == "INVESTMENT"
-            ]
-            _df_inv = _df_inv[
-                (_df_inv["date"] >= str(inv_from)) &
-                (_df_inv["date"] <= str(inv_to))
-            ]
-            if not _df_inv.empty:
-                _df_inv_disp = _df_inv[[
-                    "date", "entity", "bank", "narration",
-                    "debit", "credit", "final_group"
-                ]].copy()
-                _df_inv_disp["debit"]  = _df_inv_disp["debit"].apply(
-                    lambda x: fmt_inr(x) if float(x or 0) > 0 else "—")
-                _df_inv_disp["credit"] = _df_inv_disp["credit"].apply(
-                    lambda x: fmt_inr(x) if float(x or 0) > 0 else "—")
-                _df_inv_disp.columns = [
-                    "Date", "Entity", "Bank", "Narration",
-                    "Invested (Dr)", "Redeemed (Cr)", "Scheme"
-                ]
-                st.dataframe(
-                    _df_inv_disp,
-                    use_container_width=True,
-                    hide_index=True,
-                    height=300)
-                _inv_csv = _df_inv_disp.to_csv(index=False).encode("utf-8")
-                st.download_button(
-                    "⬇️ Export Investment Transactions",
-                    _inv_csv, "investment_transactions.csv", "text/csv")
-            else:
-                st.info("No investment transactions found in this date range.")
-        else:
-            st.info("No transactions in database.")
+    _inv_txns = get_investment_transactions(
+        date_from=str(inv_from),
+        date_to=str(inv_to),
+        entity=entity_filter,
+    )
+
+    if not _inv_txns:
+        st.info("No investment transactions found.")
+    else:
+        _df_it = pd.DataFrame(_inv_txns)
+        _df_display = _df_it.copy()
+        _df_display["debit"]  = _df_display["debit"].apply(
+            lambda x: fmt_inr(x) if float(x or 0) > 0 else "—")
+        _df_display["credit"] = _df_display["credit"].apply(
+            lambda x: fmt_inr(x) if float(x or 0) > 0 else "—")
+        _df_display.insert(0, "Tag", False)
+
+        _edited = st.data_editor(
+            _df_display[[
+                "Tag", "id", "date", "entity", "bank",
+                "narration", "debit", "credit",
+                "final_group", "scheme_name",
+                "scheme_number", "scheme_type"
+            ]],
+            column_config={
+                "Tag":           st.column_config.CheckboxColumn("✓", width="small"),
+                "id":            st.column_config.NumberColumn("ID", width="small"),
+                "date":          st.column_config.Column("Date", width="small"),
+                "narration":     st.column_config.Column("Narration", width="large"),
+                "scheme_name":   st.column_config.Column("Scheme Name", width="medium"),
+                "scheme_number": st.column_config.Column("Scheme No.", width="medium"),
+                "scheme_type":   st.column_config.SelectboxColumn(
+                    "Type", options=["FD", "MF", ""], width="small"),
+            },
+            disabled=["id", "date", "entity", "bank", "narration",
+                      "debit", "credit", "final_group"],
+            hide_index=True,
+            use_container_width=True,
+            height=400,
+            key="inv_txn_editor",
+        )
+
+        _t1, _t2 = st.columns([2, 6])
+        with _t1:
+            if st.button("Save Tags", key="save_inv_tags"):
+                _saved = 0
+                for _, _trow in _edited[_edited["Tag"] == True].iterrows():
+                    if str(_trow.get("scheme_name", "")).strip():
+                        tag_investment_transaction(
+                            transaction_id=int(_trow["id"]),
+                            scheme_name=str(_trow["scheme_name"]).strip(),
+                            scheme_number=str(_trow.get("scheme_number", "")).strip(),
+                            scheme_type=str(_trow.get("scheme_type", "")).strip(),
+                        )
+                        _saved += 1
+                if _saved:
+                    st.success(f"Tagged {_saved} transactions")
+                    st.cache_data.clear()
+                    st.rerun()
+                else:
+                    st.warning("Select rows and add scheme names first.")
 
 # ══════════════════════════════════════════════════════════════════════════════
 # UPLOAD
