@@ -22,6 +22,7 @@ from database import (
     get_investment_movements,
     add_manual_investment, get_manual_investments,
     delete_manual_investment, get_manual_investment_totals,
+    get_entity_closing_balance, get_summary_with_bank,
 )
 from config import ENTITIES, LARGE_DEBIT_THRESHOLD, DATABASE_FILE
 
@@ -53,8 +54,27 @@ def _cached_months(financial_year):
     return get_available_months(financial_year=financial_year)
 
 @st.cache_data(ttl=300)
-def _cached_uncategorized(financial_year):
-    return get_uncategorized(financial_year=financial_year)
+def _cached_uncategorized(entity, bank, month, financial_year):
+    return get_uncategorized(
+        entity=entity             if entity         != "All" else None,
+        bank=bank                 if bank           != "All" else None,
+        month=month               if month          != "All" else None,
+        financial_year=financial_year if financial_year and financial_year != "All" else None,
+    )
+
+@st.cache_data(ttl=300)
+def _cached_summary_full(entity, bank, month, date_from, date_to):
+    return get_summary_with_bank(
+        entity=entity   if entity != "All" else None,
+        bank=bank       if bank   != "All" else None,
+        month=month     if month  != "All" else None,
+        date_from=date_from if date_from else None,
+        date_to=date_to     if date_to   else None,
+    )
+
+@st.cache_data(ttl=60)
+def _cached_entity_balance(entity):
+    return get_entity_closing_balance(entity)
 
 @st.cache_data(ttl=300)
 def _cached_count(entity, bank, month, financial_year):
@@ -1676,11 +1696,20 @@ if st.sidebar.button("🔄 Refresh Data", use_container_width=True):
 # FY filter applies only to the Transactions tab (and the Month dropdown).
 # Header KPIs, Summary, Cash Flow, Investments always show the full picture.
 summary = _cached_summary(sel_entity, sel_month, None)
-totals  = summary.get("totals", {})
-inflow  = totals.get("total_inflow",  0) or 0
-outflow = totals.get("total_outflow", 0) or 0
-net     = totals.get("net_flow",      0) or 0
-uncats  = _cached_uncategorized(None)
+
+# B3 — bank-aware + date-range-aware totals for header KPIs
+_sum_full = _cached_summary_full(
+    sel_entity, sel_bank,
+    sel_month if not use_date_range else None,
+    str(sel_date_from) if use_date_range else None,
+    str(sel_date_to)   if use_date_range else None,
+)
+inflow  = _sum_full["total_receipts"]
+outflow = _sum_full["total_payouts"]
+net     = inflow - outflow
+
+# B4 — uncats respects all sidebar filters
+uncats  = _cached_uncategorized(sel_entity, sel_bank, sel_month, sel_fy)
 
 # ─── Closing balance for KPI card (single SQL query, no full row load) ─────────
 if use_date_range:
@@ -1709,6 +1738,10 @@ else:
     closing_balance = 0.0
     closing_date    = ""
     _cb_sub         = "No transactions"
+
+# B1 — entity balances for header KPI strip (always unfiltered / live)
+stores_bal   = _cached_entity_balance("Stores")
+ventures_bal = _cached_entity_balance("Ventures")
 
 # ─── Cash at Stores + investment totals for header TOTAL CASH POSITION ────────
 _cash_at_stores  = get_cash_at_stores()
@@ -1827,14 +1860,14 @@ st.markdown(f"""
             <div class="kpi-strip-sub kpi-neutral">Bank {fmt_cr(closing_balance)} · Stores {fmt_cr(_cash_at_stores)} · FD {fmt_cr(_fd_total_hdr)} · MF {fmt_cr(_mf_total_hdr)} · Manual {fmt_cr(_manual_inv_net)}</div>
         </div>
         <div class="kpi-strip-item">
-            <div class="kpi-strip-label">TOTAL RECEIPTS</div>
-            <div class="kpi-strip-value pos"><span class="kpi-arrow-up">▲</span>{fmt_cr(inflow)}</div>
-            <div class="kpi-strip-sub kpi-positive">All credits for period</div>
+            <div class="kpi-strip-label">STORES BALANCE</div>
+            <div class="kpi-strip-value">{fmt_cr(stores_bal)}</div>
+            <div class="kpi-strip-sub kpi-neutral">Bank closing · All accounts</div>
         </div>
         <div class="kpi-strip-item">
-            <div class="kpi-strip-label">TOTAL PAYOUTS</div>
-            <div class="kpi-strip-value neg"><span class="kpi-arrow-down">▼</span>{fmt_cr(outflow)}</div>
-            <div class="kpi-strip-sub kpi-negative">All debits for period</div>
+            <div class="kpi-strip-label">VENTURES BALANCE</div>
+            <div class="kpi-strip-value">{fmt_cr(ventures_bal)}</div>
+            <div class="kpi-strip-sub kpi-neutral">Bank closing · All accounts</div>
         </div>
         <div class="kpi-strip-item">
             <div class="kpi-strip-label">NET MOVEMENT</div>
@@ -1937,9 +1970,19 @@ if selected_tab == "Summary":
     # ── Account Balance Summary ───────────────────────────────────────────────
     _acct_balances = get_account_balances(financial_year=sel_fy if sel_fy != "All" else None)
 
-    def _render_entity_subtotal(rows, entity_name):
-        sub = sum(r["balance"] for r in rows if r["entity"] == entity_name)
-        return sub
+    def _render_entity_subtotal(rows, entity_name, manual_totals=None, inv_register=None):
+        bank_sub = sum(r["balance"] for r in rows if r["entity"] == entity_name)
+        inv_net  = sum(
+            (t["invested"] or 0) - (t["redeemed"] or 0)
+            for t in (manual_totals or [])
+            if t["entity"] == entity_name
+        )
+        reg_net  = sum(
+            r["opening_value"] or 0
+            for r in (inv_register or [])
+            if r["entity"] == entity_name
+        )
+        return bank_sub + inv_net + reg_net
 
     st.markdown('<div class="section-header" style="margin-bottom:10px;">Account Balance Summary</div>',
                 unsafe_allow_html=True)
@@ -1973,10 +2016,14 @@ if selected_tab == "Summary":
                 f'<td class="abs-bal">₹{_ar["balance"]:,.0f}</td>'
                 f'</tr>'
             )
-        _sub = _render_entity_subtotal(_acct_balances, _entity_name)
+        _sub = _render_entity_subtotal(
+            _acct_balances, _entity_name,
+            manual_totals=_manual_totals,
+            inv_register=get_investment_register(),
+        )
         _abs_rows_html += (
             f'<tr class="abs-subtotal">'
-            f'<td colspan="4">{_entity_name} Subtotal</td>'
+            f'<td colspan="4">{_entity_name} Subtotal (Bank + Inv)</td>'
             f'<td class="abs-bal">₹{_sub:,.0f}</td>'
             f'</tr>'
         )
@@ -2302,35 +2349,10 @@ elif selected_tab == "Transactions":
         st.session_state["txn_mg"]     = "All"
         st.session_state["txn_search"] = ""
 
-    st.markdown("""
-<div class="txn-filter-bar">
-  <div class="txn-filter-title">Transaction Filters</div>
-""", unsafe_allow_html=True)
-    col1, col2, col3, col4 = st.columns([2, 2, 2, 1])
-    with col1:
-        sel_fg = st.selectbox(
-            "Category", fg_options,
-            index=fg_options.index(st.session_state.get("txn_fg", "All"))
-                  if st.session_state.get("txn_fg", "All") in fg_options else 0,
-            key="txn_fg")
-    with col2:
-        sel_mg = st.selectbox(
-            "Main Group", mg_options,
-            index=mg_options.index(st.session_state.get("txn_mg", "All"))
-                  if st.session_state.get("txn_mg", "All") in mg_options else 0,
-            key="txn_mg")
-    with col3:
-        search = st.text_input("Search narration", key="txn_search",
-                               placeholder="Type to search…")
-    with col4:
-        st.markdown("<br>", unsafe_allow_html=True)
-        if st.button("✕ Clear", use_container_width=True):
-            st.session_state["clear_txn_filters"] = True
-            try:
-                st.rerun()
-            except AttributeError:
-                st.experimental_rerun()
-    st.markdown('</div>', unsafe_allow_html=True)
+    # ── Read filter values from session state (widgets rendered below OB table) ─
+    sel_fg = st.session_state.get("txn_fg", "All")
+    sel_mg = st.session_state.get("txn_mg", "All")
+    search = st.session_state.get("txn_search", "")
 
     # ── Map UI selections to SQL-level params ─────────────────────────────────
     _pag_cat     = None
@@ -2403,6 +2425,37 @@ elif selected_tab == "Transactions":
                     ob_show[_c] = ob_show[_c].apply(fmt_inr)
             ob_show.columns = [c.replace("_", " ").title() for c in ob_show.columns]
             st.dataframe(ob_show, use_container_width=True, hide_index=True)
+
+        st.markdown("---")
+        st.markdown("""
+<div class="txn-filter-bar">
+  <div class="txn-filter-title">Transaction Filters</div>
+""", unsafe_allow_html=True)
+        _fc1, _fc2, _fc3, _fc4 = st.columns([2, 2, 2, 1])
+        with _fc1:
+            sel_fg = st.selectbox(
+                "Category", fg_options,
+                index=fg_options.index(st.session_state.get("txn_fg", "All"))
+                      if st.session_state.get("txn_fg", "All") in fg_options else 0,
+                key="txn_fg")
+        with _fc2:
+            sel_mg = st.selectbox(
+                "Main Group", mg_options,
+                index=mg_options.index(st.session_state.get("txn_mg", "All"))
+                      if st.session_state.get("txn_mg", "All") in mg_options else 0,
+                key="txn_mg")
+        with _fc3:
+            search = st.text_input("Search narration", key="txn_search",
+                                   placeholder="Type to search…")
+        with _fc4:
+            st.markdown("<br>", unsafe_allow_html=True)
+            if st.button("✕ Clear", use_container_width=True):
+                st.session_state["clear_txn_filters"] = True
+                try:
+                    st.rerun()
+                except AttributeError:
+                    st.experimental_rerun()
+        st.markdown('</div>', unsafe_allow_html=True)
 
         if not txn_rows.empty:
             # ── Category lookup ───────────────────────────────────────────────
@@ -2725,6 +2778,8 @@ elif selected_tab == "Exception Report":
             bg, border, icon = "#FFF5F5", "#E53E3E", "🔴"
             msg = f"No data loaded — {s['last_date']}"
 
+        _cb = s.get("closing_bal")
+        _cb_str = (f" · Closing: ₹{fmt_inr(_cb)}" if _cb is not None else "")
         st.markdown(f"""
     <div style="background:{bg}; border-left:4px solid {border};
          border-radius:6px; padding:10px 16px; margin:5px 0;
@@ -2734,7 +2789,7 @@ elif selected_tab == "Exception Report":
             &nbsp;|&nbsp; {msg}
         </span>
         <span style="font-size:11px; color:#8896A5;">
-            {s['total_rows']:,} rows
+            {s['total_rows']:,} rows{_cb_str}
         </span>
     </div>
     """, unsafe_allow_html=True)
@@ -3838,7 +3893,11 @@ elif selected_tab == "Investments":
     st.markdown('<div class="section-header" style="margin-bottom:10px;">Investment Portfolio</div>',
                 unsafe_allow_html=True)
 
-    inv_movements  = get_investment_movements(entity=entity_filter)
+    inv_movements  = get_investment_movements(
+        entity=entity_filter,
+        date_from=str(inv_from),
+        date_to=str(inv_to),
+    )
     inv_register   = get_investment_register()
     manual_totals  = get_manual_investment_totals()
     register_map   = {r["scheme_name"]: r for r in inv_register}

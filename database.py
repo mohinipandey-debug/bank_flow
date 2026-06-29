@@ -427,18 +427,30 @@ def get_all_transactions(entity=None, bank=None, month=None, category=None,
     return [dict(r) for r in rows]
 
 
-def get_uncategorized(financial_year=None):
-    conn = get_connection()
-    fy_clause = " AND financial_year=?" if financial_year else ""
-    fy_param  = [financial_year]        if financial_year else []
+def get_uncategorized(entity=None, bank=None,
+                      month=None, financial_year=None):
+    conn   = get_connection()
+    where  = """WHERE (final_group='Uncategorized'
+                OR final_group IS NULL
+                OR TRIM(final_group)='')
+                AND final_group != 'OPENING BALANCE'"""
+    params = []
+    if entity and entity != "All":
+        where += " AND entity=?"; params.append(entity)
+    if bank and bank != "All":
+        where += " AND bank=?"; params.append(bank)
+    if month and month != "All":
+        where += " AND strftime('%Y-%m',date)=?"; params.append(month)
+    if financial_year and financial_year != "All":
+        where += " AND financial_year=?"; params.append(financial_year)
+
     rows = conn.execute(f"""
-        SELECT narration, entity, COUNT(*) as count, SUM(debit) as total_debit
-        FROM transactions
-        WHERE (category='Uncategorized' OR final_group IS NULL OR final_group='')
-        {fy_clause}
+        SELECT narration, entity, COUNT(*) as count,
+               SUM(debit) as total_debit
+        FROM transactions {where}
         GROUP BY narration, entity
         ORDER BY count DESC
-    """, fy_param).fetchall()
+    """, params).fetchall()
     conn.close()
     return [dict(r) for r in rows]
 
@@ -665,42 +677,51 @@ def get_large_debits(threshold, financial_year=None):
 def get_missing_statements(financial_year=None):
     from config import ENTITIES
 
-    today         = datetime.date.today()
-    current_month = today.strftime("%Y-%m")
-    conn          = get_connection()
-    results       = []
+    today          = datetime.date.today()
+    current_month  = today.strftime("%Y-%m")
+    fy_clause      = ""
+    fy_params_base = []
+    if financial_year and financial_year != "All":
+        fy_clause      = "AND financial_year=?"
+        fy_params_base = [financial_year]
 
-    fy_clause = " AND financial_year=?" if financial_year else ""
-    fy_param  = [financial_year]        if financial_year else []
+    conn    = get_connection()
+    results = []
 
     for entity, banks in ENTITIES.items():
         for bank in banks:
             row = conn.execute(f"""
-                SELECT MAX(date) as last_date, COUNT(*) as total_rows
+                SELECT MAX(date) as last_date,
+                       COUNT(*)  as total_rows
                 FROM transactions
-                WHERE bank = ?
+                WHERE bank=?
                 AND final_group != 'OPENING BALANCE'
                 {fy_clause}
-            """, [bank] + fy_param).fetchone()
+            """, [bank] + fy_params_base).fetchone()
 
             last_date  = row["last_date"]  if row else None
             total_rows = row["total_rows"] if row else 0
+
+            closing_bal = None
+            if last_date:
+                cb_row = conn.execute("""
+                    SELECT balance FROM transactions
+                    WHERE bank=?
+                    AND date=?
+                    AND final_group != 'OPENING BALANCE'
+                    AND balance IS NOT NULL
+                    ORDER BY id DESC LIMIT 1
+                """, [bank, last_date]).fetchone()
+                if cb_row:
+                    closing_bal = cb_row["balance"]
 
             if last_date:
                 last_dt     = datetime.date.fromisoformat(last_date)
                 days_ago    = (today - last_dt).days
                 has_current = last_dt.strftime("%Y-%m") == current_month
             else:
-                last_dt     = None
                 days_ago    = 999
                 has_current = False
-
-            if has_current:
-                status = "ok"
-            elif days_ago <= 40:
-                status = "warning"
-            else:
-                status = "missing"
 
             results.append({
                 "entity":      entity,
@@ -709,7 +730,12 @@ def get_missing_statements(financial_year=None):
                 "days_ago":    days_ago,
                 "has_current": has_current,
                 "total_rows":  total_rows,
-                "status":      status,
+                "closing_bal": closing_bal,
+                "status": (
+                    "ok"      if has_current else
+                    "warning" if days_ago <= 40 else
+                    "missing"
+                ),
             })
 
     conn.close()
@@ -820,6 +846,87 @@ def get_closing_balance(entity=None, bank=None, month=None, financial_year=None,
     total = sum(v for v in by_bank.values() if v is not None)
     conn.close()
     return {"by_bank": by_bank, "dates": dates, "total": total}
+
+
+def get_entity_closing_balance(entity, financial_year=None):
+    """
+    Returns total closing balance for a specific entity.
+    Uses last transaction balance per bank for that entity.
+    Falls back to OB row for banks with no transactions.
+    """
+    conn      = get_connection()
+    fy_clause = ""
+    fy_params = []
+    if financial_year and financial_year != "All":
+        fy_clause = "AND financial_year=?"
+        fy_params = [financial_year]
+
+    banks = conn.execute(f"""
+        SELECT DISTINCT bank FROM transactions
+        WHERE entity=? {fy_clause}
+    """, [entity] + fy_params).fetchall()
+
+    total = 0
+    for b in banks:
+        bank = b["bank"]
+        row  = conn.execute(f"""
+            SELECT balance FROM transactions
+            WHERE bank=? AND entity=?
+            AND final_group != 'OPENING BALANCE'
+            AND balance IS NOT NULL
+            {fy_clause}
+            ORDER BY date DESC, id DESC LIMIT 1
+        """, [bank, entity] + fy_params).fetchone()
+
+        if row and row["balance"] is not None:
+            total += row["balance"]
+        else:
+            ob = conn.execute("""
+                SELECT balance FROM transactions
+                WHERE bank=? AND entity=?
+                AND final_group='OPENING BALANCE'
+                ORDER BY date DESC LIMIT 1
+            """, [bank, entity]).fetchone()
+            if ob and ob["balance"] is not None:
+                total += ob["balance"]
+
+    conn.close()
+    return total
+
+
+def get_summary_with_bank(entity=None, bank=None,
+                          month=None, date_from=None, date_to=None):
+    """
+    Summary query that accepts bank AND date_from/date_to filters.
+    Fixes the bug where _cached_summary() ignored bank and date range.
+    """
+    conn   = get_connection()
+    where  = "WHERE final_group != 'OPENING BALANCE'"
+    params = []
+
+    if entity and entity != "All":
+        where += " AND entity=?"; params.append(entity)
+    if bank and bank != "All":
+        where += " AND bank=?"; params.append(bank)
+    if date_from and date_to:
+        where += " AND date BETWEEN ? AND ?"
+        params += [date_from, date_to]
+    elif month and month != "All":
+        where += " AND strftime('%Y-%m',date)=?"; params.append(month)
+
+    row = conn.execute(f"""
+        SELECT
+            ROUND(SUM(CASE WHEN credit>0 THEN credit ELSE 0 END),2) as cr,
+            ROUND(SUM(CASE WHEN debit>0  THEN debit  ELSE 0 END),2) as dr,
+            COUNT(*) as cnt
+        FROM transactions {where}
+    """, params).fetchone()
+    conn.close()
+    return {
+        "total_receipts": row["cr"] or 0,
+        "total_payouts":  row["dr"] or 0,
+        "txn_count":      row["cnt"] or 0,
+    }
 
 
 def get_paginated_transactions(entity=None, bank=None, month=None,
@@ -1131,7 +1238,7 @@ def tag_investment_transaction(transaction_id, scheme_name,
     conn.close()
 
 
-def get_investment_movements(entity=None):
+def get_investment_movements(entity=None, date_from=None, date_to=None):
     """
     Aggregates investment transactions by scheme (via tagging).
     Returns per-scheme invested/redeemed totals.
@@ -1142,6 +1249,10 @@ def get_investment_movements(entity=None):
     params = []
     if entity and entity != "All":
         where += " AND t.entity=?"; params.append(entity)
+    if date_from:
+        where += " AND t.date>=?"; params.append(date_from)
+    if date_to:
+        where += " AND t.date<=?"; params.append(date_to)
 
     rows = conn.execute(f"""
         SELECT
