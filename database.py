@@ -1599,5 +1599,244 @@ def get_manual_investment_totals():
     return [dict(r) for r in rows]
 
 
+def import_investment_excel(filepath):
+    """
+    Import investment transactions from Excel.
+    Expected columns:
+    Date | Scheme Name | Scheme Number | Type (FD/MF) |
+    Amount | Entry Type (Invested/Redeemed) | Entity
+    All fields mandatory.
+    Returns dict: inserted, skipped, errors, error_rows
+    """
+    import pandas as pd
+
+    try:
+        df = pd.read_excel(filepath, dtype=str)
+    except Exception as e:
+        return {"inserted": 0, "skipped": 0,
+                "errors": 1, "error_rows": [str(e)]}
+
+    df.columns = [str(c).strip() for c in df.columns]
+
+    COL_MAP = {
+        "date":        ["Date", "DATE"],
+        "scheme_name": ["Scheme Name", "SchemeName", "SCHEME NAME"],
+        "scheme_no":   ["Scheme Number", "SchemeNumber", "SCHEME NUMBER",
+                        "Scheme No", "Scheme No."],
+        "type":        ["Type", "TYPE", "Scheme Type"],
+        "amount":      ["Amount", "AMOUNT"],
+        "entry_type":  ["Entry Type", "EntryType", "Invested or Redeemed",
+                        "Type", "ENTRY TYPE"],
+        "entity":      ["Entity", "ENTITY"],
+    }
+
+    def find_col(candidates):
+        for c in candidates:
+            if c in df.columns:
+                return c
+        return None
+
+    cols = {k: find_col(v) for k, v in COL_MAP.items()}
+    missing = [k for k, v in cols.items() if v is None]
+    if missing:
+        return {
+            "inserted": 0, "skipped": 0, "errors": 1,
+            "error_rows": [
+                f"Missing columns: {missing}. "
+                f"Available: {list(df.columns)}"
+            ]
+        }
+
+    conn       = get_connection()
+    inserted   = 0
+    skipped    = 0
+    errors     = 0
+    error_rows = []
+
+    for idx, row in df.iterrows():
+        try:
+            date_raw    = str(row.get(cols["date"])        or "").strip()
+            scheme_name = str(row.get(cols["scheme_name"]) or "").strip()
+            scheme_no   = str(row.get(cols["scheme_no"])   or "").strip()
+            stype       = str(row.get(cols["type"])        or "").strip()
+            amount_raw  = str(row.get(cols["amount"])      or "").strip()
+            entry_type  = str(row.get(cols["entry_type"])  or "").strip()
+            entity      = str(row.get(cols["entity"])      or "").strip()
+
+            missing_vals = []
+            if not date_raw    or date_raw    in ("nan", "None", "-"): missing_vals.append("Date")
+            if not scheme_name or scheme_name in ("nan", "None", "-"): missing_vals.append("Scheme Name")
+            if not scheme_no   or scheme_no   in ("nan", "None", "-"): missing_vals.append("Scheme Number")
+            if not stype       or stype       in ("nan", "None", "-"): missing_vals.append("Type")
+            if not amount_raw  or amount_raw  in ("nan", "None", "-"): missing_vals.append("Amount")
+            if not entry_type  or entry_type  in ("nan", "None", "-"): missing_vals.append("Entry Type")
+            if not entity      or entity      in ("nan", "None", "-"): missing_vals.append("Entity")
+
+            if missing_vals:
+                skipped += 1
+                error_rows.append(f"Row {idx+2}: Missing {missing_vals}")
+                continue
+
+            import pandas as _pd
+            try:
+                entry_date = _pd.to_datetime(date_raw).strftime("%Y-%m-%d")
+            except Exception:
+                skipped += 1
+                error_rows.append(f"Row {idx+2}: Invalid date '{date_raw}'")
+                continue
+
+            try:
+                amount = abs(float(
+                    amount_raw.replace(",", "").replace("₹", "").strip()))
+            except Exception:
+                skipped += 1
+                error_rows.append(f"Row {idx+2}: Invalid amount '{amount_raw}'")
+                continue
+
+            stype_clean = stype.upper()
+            if stype_clean not in ("FD", "MF"):
+                skipped += 1
+                error_rows.append(
+                    f"Row {idx+2}: Type must be FD or MF, got '{stype}'")
+                continue
+
+            et_clean = entry_type.strip().title()
+            if et_clean not in ("Invested", "Redeemed"):
+                skipped += 1
+                error_rows.append(
+                    f"Row {idx+2}: Entry Type must be "
+                    f"Invested or Redeemed, got '{entry_type}'")
+                continue
+
+            entity_clean = entity.strip().title()
+            if entity_clean not in ("Stores", "Ventures"):
+                skipped += 1
+                error_rows.append(
+                    f"Row {idx+2}: Entity must be "
+                    f"Stores or Ventures, got '{entity}'")
+                continue
+
+            conn.execute("""
+                INSERT INTO manual_investments
+                (entry_date, scheme_name, scheme_type, amount,
+                 entry_type, entity, notes)
+                VALUES (?,?,?,?,?,?,?)
+            """, [entry_date, scheme_name, stype_clean,
+                  amount, et_clean, entity_clean,
+                  f"Scheme No: {scheme_no}"])
+            inserted += 1
+
+        except Exception as e:
+            errors += 1
+            error_rows.append(f"Row {idx+2}: {str(e)}")
+
+    conn.commit()
+    conn.close()
+    return {
+        "inserted":   inserted,
+        "skipped":    skipped,
+        "errors":     errors,
+        "error_rows": error_rows,
+    }
+
+
+def get_investment_kpis(entity=None):
+    """
+    Returns Opening, MF Balance, FD Balance, Closing for Investment tab flash cards.
+    Closing = Opening (register) + bank txn movements + manual entries.
+    """
+    conn = get_connection()
+
+    where_reg  = ""
+    params_reg = []
+    if entity and entity != "All":
+        where_reg  = "WHERE entity=?"
+        params_reg = [entity]
+
+    reg_rows = conn.execute(f"""
+        SELECT scheme_type, SUM(opening_value) as opening
+        FROM investment_register
+        {where_reg}
+        GROUP BY scheme_type
+    """, params_reg).fetchall()
+
+    fd_opening    = sum(r["opening"] or 0 for r in reg_rows if r["scheme_type"] == "FD")
+    mf_opening    = sum(r["opening"] or 0 for r in reg_rows if r["scheme_type"] == "MF")
+    total_opening = fd_opening + mf_opening
+
+    where_txn  = "WHERE UPPER(main_group)='INVESTMENT'"
+    params_txn = []
+    if entity and entity != "All":
+        where_txn  += " AND entity=?"
+        params_txn  = [entity]
+
+    txn_rows = conn.execute(f"""
+        SELECT
+            COALESCE(m.scheme_type, '') as scheme_type,
+            ROUND(SUM(CASE WHEN t.debit>0  THEN t.debit  ELSE 0 END),2) as invested,
+            ROUND(SUM(CASE WHEN t.credit>0 THEN t.credit ELSE 0 END),2) as redeemed
+        FROM transactions t
+        LEFT JOIN investment_txn_mapping m ON t.id=m.transaction_id
+        {where_txn}
+        GROUP BY m.scheme_type
+    """, params_txn).fetchall()
+
+    fd_txn_net = sum(
+        (r["invested"] or 0) - (r["redeemed"] or 0)
+        for r in txn_rows if r["scheme_type"] == "FD")
+    mf_txn_net = sum(
+        (r["invested"] or 0) - (r["redeemed"] or 0)
+        for r in txn_rows if r["scheme_type"] == "MF")
+
+    where_man  = "WHERE 1=1"
+    params_man = []
+    if entity and entity != "All":
+        where_man  += " AND entity=?"
+        params_man  = [entity]
+
+    man_rows = conn.execute(f"""
+        SELECT scheme_type,
+               SUM(CASE WHEN entry_type='Invested' THEN amount ELSE 0 END) as inv,
+               SUM(CASE WHEN entry_type='Redeemed' THEN amount ELSE 0 END) as red
+        FROM manual_investments
+        {where_man}
+        GROUP BY scheme_type
+    """, params_man).fetchall()
+
+    fd_man_net = sum(
+        (r["inv"] or 0) - (r["red"] or 0)
+        for r in man_rows if r["scheme_type"] == "FD")
+    mf_man_net = sum(
+        (r["inv"] or 0) - (r["red"] or 0)
+        for r in man_rows if r["scheme_type"] == "MF")
+
+    fd_balance = fd_opening + fd_txn_net + fd_man_net
+    mf_balance = mf_opening + mf_txn_net + mf_man_net
+    closing    = fd_balance + mf_balance
+
+    conn.close()
+    return {
+        "opening":    total_opening,
+        "fd_balance": fd_balance,
+        "mf_balance": mf_balance,
+        "closing":    closing,
+    }
+
+
+def get_entity_investment_balances():
+    """
+    Returns FD and MF balances per entity.
+    Used for top banner and account balance summary.
+    """
+    result = {}
+    for entity in ["Stores", "Ventures"]:
+        kpis = get_investment_kpis(entity=entity)
+        result[entity] = {
+            "fd_balance": kpis["fd_balance"],
+            "mf_balance": kpis["mf_balance"],
+        }
+    return result
+
+
 if __name__ == "__main__":
     init_db()

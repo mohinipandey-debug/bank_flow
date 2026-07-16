@@ -23,6 +23,8 @@ from database import (
     add_manual_investment, get_manual_investments,
     delete_manual_investment, get_manual_investment_totals,
     get_entity_closing_balance, get_summary_with_bank,
+    import_investment_excel, get_investment_kpis,
+    get_entity_investment_balances,
 )
 from config import ENTITIES, LARGE_DEBIT_THRESHOLD, DATABASE_FILE
 
@@ -102,6 +104,10 @@ def _cached_inv_header_totals():
         "fd": sum(r["current_value"] for r in _d if r["scheme_type"] == "FD"),
         "mf": sum(r["current_value"] for r in _d if r["scheme_type"] == "MF"),
     }
+
+@st.cache_data(ttl=60)
+def _cached_inv_bals():
+    return get_entity_investment_balances()
 from queries.cashflow_queries import fetch_cf
 from tabs.overview import render_overview
 from tabs.review_queue import render_review_queue
@@ -1562,9 +1568,14 @@ _first_of_month = _today.replace(day=1)
 
 # ─── Sidebar ───────────────────────────────────────────────────────────────────
 import os as _os, base64 as _b64
-_logo_path = _os.path.join(_os.path.dirname(__file__), "citykart_logo.png")
-if _os.path.exists(_logo_path):
-    with open(_logo_path, "rb") as _lf:
+LOGO_PATH = _os.path.join(_os.path.dirname(__file__), "logo.png")
+_logo_display_path = LOGO_PATH
+if not _os.path.exists(LOGO_PATH):
+    _fallback = _os.path.join(_os.path.dirname(__file__), "citykart_logo.png")
+    _logo_display_path = _fallback if _os.path.exists(_fallback) else None
+
+if _logo_display_path:
+    with open(_logo_display_path, "rb") as _lf:
         _logo_b64 = _b64.b64encode(_lf.read()).decode()
     st.sidebar.markdown(f"""
 <div style="padding:10px 0 14px 0;text-align:center;">
@@ -1584,9 +1595,24 @@ else:
     color:var(--tx-4,#96A3B4);font-size:11px;font-weight:600;
     letter-spacing:0.08em;text-transform:uppercase;
 ">
-  <span style="opacity:0.5;">🏦</span> Add citykart_logo.png
+  <span style="opacity:0.5;">🏦</span> Add logo.png
 </div>
 """, unsafe_allow_html=True)
+
+with st.sidebar.expander("🖼 Update Logo", expanded=False):
+    _logo_upload_sb = st.file_uploader(
+        "Upload PNG logo", type=["png", "jpg", "jpeg"], key="logo_upload_sb"
+    )
+    if _logo_upload_sb is not None:
+        if st.button("💾 Save Logo", key="logo_save_sb"):
+            with open(LOGO_PATH, "wb") as _lw:
+                _lw.write(_logo_upload_sb.getvalue())
+            st.success("Logo saved as logo.png — persists after restart.")
+            st.cache_data.clear()
+            try:
+                st.rerun()
+            except AttributeError:
+                st.experimental_rerun()
 
 # ── Derive default FY from latest transaction date in DB ──────────────────────
 @st.cache_data(ttl=300)
@@ -1740,8 +1766,15 @@ else:
     _cb_sub         = "No transactions"
 
 # B1 — entity balances for header KPI strip (always unfiltered / live)
-stores_bal   = _cached_entity_balance("Stores")
-ventures_bal = _cached_entity_balance("Ventures")
+stores_bal    = _cached_entity_balance("Stores")
+ventures_bal  = _cached_entity_balance("Ventures")
+inv_bals      = _cached_inv_bals()
+stores_bank   = stores_bal
+ventures_bank = ventures_bal
+stores_mf     = inv_bals["Stores"]["mf_balance"]
+stores_fd     = inv_bals["Stores"]["fd_balance"]
+ventures_mf   = inv_bals["Ventures"]["mf_balance"]
+ventures_fd   = inv_bals["Ventures"]["fd_balance"]
 
 # ─── Cash at Stores + investment totals for header TOTAL CASH POSITION ────────
 _cash_at_stores  = get_cash_at_stores()
@@ -1750,7 +1783,9 @@ _fd_total_hdr    = _inv_hdr["fd"]
 _mf_total_hdr    = _inv_hdr["mf"]
 _manual_totals   = get_manual_investment_totals()
 _manual_inv_net  = sum((t["invested"] or 0) - (t["redeemed"] or 0) for t in _manual_totals)
-_total_cash_pos  = closing_balance + _cash_at_stores + _fd_total_hdr + _mf_total_hdr + _manual_inv_net
+_total_cash_pos  = (stores_bank + ventures_bank +
+                    stores_mf + ventures_mf +
+                    stores_fd + ventures_fd + _cash_at_stores)
 
 # ─── Transaction count (lightweight SQL COUNT — no row loading) ───────────────
 txn_count = _cached_count(sel_entity, sel_bank, sel_month, None)
@@ -1857,32 +1892,37 @@ st.markdown(f"""
         <div class="kpi-strip-hero">
             <div class="kpi-strip-label">TOTAL CASH POSITION</div>
             <div style="font-size:36px;font-weight:800;color:#FFFFFF;letter-spacing:-1.2px;line-height:1;margin-bottom:3px;">{fmt_cr(_total_cash_pos)}</div>
-            <div class="kpi-strip-sub kpi-neutral">Bank {fmt_cr(closing_balance)} · Stores {fmt_cr(_cash_at_stores)} · FD {fmt_cr(_fd_total_hdr)} · MF {fmt_cr(_mf_total_hdr)} · Manual {fmt_cr(_manual_inv_net)}</div>
+            <div class="kpi-strip-sub kpi-neutral">Bank {fmt_cr(closing_balance)} · Cash {fmt_cr(_cash_at_stores)} · FD {fmt_cr(stores_fd+ventures_fd)} · MF {fmt_cr(stores_mf+ventures_mf)}</div>
         </div>
         <div class="kpi-strip-item">
-            <div class="kpi-strip-label">STORES BALANCE</div>
-            <div class="kpi-strip-value">{fmt_cr(stores_bal)}</div>
+            <div class="kpi-strip-label">STORES BANK</div>
+            <div class="kpi-strip-value">{fmt_cr(stores_bank)}</div>
             <div class="kpi-strip-sub kpi-neutral">Bank closing · All accounts</div>
         </div>
         <div class="kpi-strip-item">
-            <div class="kpi-strip-label">VENTURES BALANCE</div>
-            <div class="kpi-strip-value">{fmt_cr(ventures_bal)}</div>
+            <div class="kpi-strip-label">STORES MF</div>
+            <div class="kpi-strip-value" style="color:#A78BFA;">{fmt_cr(stores_mf)}</div>
+            <div class="kpi-strip-sub kpi-neutral">Mutual funds · Stores</div>
+        </div>
+        <div class="kpi-strip-item">
+            <div class="kpi-strip-label">STORES FD</div>
+            <div class="kpi-strip-value" style="color:#60A5FA;">{fmt_cr(stores_fd)}</div>
+            <div class="kpi-strip-sub kpi-neutral">Fixed deposits · Stores</div>
+        </div>
+        <div class="kpi-strip-item">
+            <div class="kpi-strip-label">VENTURES BANK</div>
+            <div class="kpi-strip-value">{fmt_cr(ventures_bank)}</div>
             <div class="kpi-strip-sub kpi-neutral">Bank closing · All accounts</div>
         </div>
         <div class="kpi-strip-item">
-            <div class="kpi-strip-label">NET MOVEMENT</div>
-            <div class="kpi-strip-value {net_class}">{_net_arrow} {fmt_cr(net)}</div>
-            <div class="kpi-strip-sub {_net_sub_cls}">Receipts minus payouts</div>
+            <div class="kpi-strip-label">VENTURES MF</div>
+            <div class="kpi-strip-value" style="color:#A78BFA;">{fmt_cr(ventures_mf)}</div>
+            <div class="kpi-strip-sub kpi-neutral">Mutual funds · Ventures</div>
         </div>
         <div class="kpi-strip-item">
-            <div class="kpi-strip-label">THIS WEEK INFLOW</div>
-            <div class="kpi-strip-value pos">{fmt_cr(_this_wk_in)}</div>
-            <div><span class="kpi-wow {_wow_in_cls}">{_wow_in_txt}</span></div>
-        </div>
-        <div class="kpi-strip-item">
-            <div class="kpi-strip-label">EXCEPTIONS</div>
-            <div class="kpi-strip-value" style="color:#FBBF24;">{_s_uncat:,}</div>
-            <div><span class="kpi-wow {_exc_cls}">{_exc_txt}</span></div>
+            <div class="kpi-strip-label">VENTURES FD</div>
+            <div class="kpi-strip-value" style="color:#60A5FA;">{fmt_cr(ventures_fd)}</div>
+            <div class="kpi-strip-sub kpi-neutral">Fixed deposits · Ventures</div>
         </div>
     </div>
 </div>
@@ -1970,102 +2010,91 @@ if selected_tab == "Summary":
     # ── Account Balance Summary ───────────────────────────────────────────────
     _acct_balances = get_account_balances(financial_year=sel_fy if sel_fy != "All" else None)
 
-    def _render_entity_subtotal(rows, entity_name, manual_totals=None, inv_register=None):
-        bank_sub = sum(r["balance"] for r in rows if r["entity"] == entity_name)
-        inv_net  = sum(
-            (t["invested"] or 0) - (t["redeemed"] or 0)
-            for t in (manual_totals or [])
-            if t["entity"] == entity_name
-        )
-        reg_net  = sum(
-            r["opening_value"] or 0
-            for r in (inv_register or [])
-            if r["entity"] == entity_name
-        )
-        return bank_sub + inv_net + reg_net
+    def _render_entity_subtotal(entity_name, entity_bank_total, rows, _inv_bals):
+        _pill_cls = "abs-stores" if entity_name == "Stores" else "abs-ventures"
+        for acc in rows:
+            rcols = st.columns([2, 1.5, 1.5, 1, 2])
+            _vals = [
+                f'<span class="abs-pill {_pill_cls}">{entity_name}</span>',
+                acc["bank"],
+                acc["purpose"],
+                acc["bank_id"],
+                f'<div style="text-align:right;font-variant-numeric:tabular-nums;">₹{acc["balance"]:,.0f}</div>',
+            ]
+            for _c, _v in zip(rcols, _vals):
+                with _c:
+                    st.markdown(_v, unsafe_allow_html=True)
+
+        _eb  = _inv_bals.get(entity_name, {})
+        _mf  = _eb.get("mf_balance", 0)
+        _fd  = _eb.get("fd_balance", 0)
+
+        if _mf:
+            mrcols = st.columns([2, 1.5, 1.5, 1, 2])
+            for _c, _v in zip(mrcols, [
+                f'<span class="abs-pill" style="background:#EDE9FE;color:#5B21B6;">MF</span> {entity_name}',
+                "Mutual Fund", "Investment", "—",
+                f'<div style="text-align:right;color:#5B21B6;font-weight:700;">₹{_mf:,.0f}</div>',
+            ]):
+                with _c:
+                    st.markdown(_v, unsafe_allow_html=True)
+
+        if _fd:
+            fdcols = st.columns([2, 1.5, 1.5, 1, 2])
+            for _c, _v in zip(fdcols, [
+                f'<span class="abs-pill" style="background:#DBEAFE;color:#1E40AF;">FD</span> {entity_name}',
+                "Fixed Deposit", "Investment", "—",
+                f'<div style="text-align:right;color:#1E40AF;font-weight:700;">₹{_fd:,.0f}</div>',
+            ]):
+                with _c:
+                    st.markdown(_v, unsafe_allow_html=True)
+
+        entity_total = entity_bank_total + _mf + _fd
+        st.markdown(
+            f'<div style="background:#F0F4FF;padding:6px 12px;border-radius:6px;'
+            f'font-weight:700;color:#1B2B4B;display:flex;justify-content:space-between;'
+            f'margin-bottom:8px;">'
+            f'<span>{entity_name} Subtotal (Bank + MF + FD)</span>'
+            f'<span>₹{entity_total:,.0f}</span></div>',
+            unsafe_allow_html=True)
+        return entity_total
 
     st.markdown('<div class="section-header" style="margin-bottom:10px;">Account Balance Summary</div>',
                 unsafe_allow_html=True)
 
     _abs_css = """
 <style>
-.abs-table{width:100%;border-collapse:collapse;font-size:13px;font-family:'Inter',sans-serif;}
-.abs-table th{background:#1B2B4B;color:#fff;padding:7px 12px;text-align:left;font-weight:600;font-size:11px;letter-spacing:.05em;text-transform:uppercase;}
-.abs-table td{padding:7px 12px;border-bottom:1px solid #EDF0F5;color:#2D3748;}
-.abs-table tr:hover td{background:#F7F9FC;}
-.abs-subtotal td{background:#F0F4FF;font-weight:700;color:#1B2B4B;}
-.abs-total td{background:#1B2B4B;color:#fff;font-weight:800;font-size:14px;}
-.abs-bal{text-align:right;font-variant-numeric:tabular-nums;}
 .abs-pill{display:inline-block;padding:2px 8px;border-radius:10px;font-size:10px;font-weight:700;letter-spacing:.04em;}
 .abs-stores{background:#DBEAFE;color:#1E40AF;}
 .abs-ventures{background:#FCE7F3;color:#9D174D;}
 </style>"""
     st.markdown(_abs_css, unsafe_allow_html=True)
 
-    _abs_rows_html = ""
+    _hcols = st.columns([2, 1.5, 1.5, 1, 2])
+    for _c, _hdr in zip(_hcols, ["Entity", "Bank / Type", "Purpose", "Account", "Balance"]):
+        with _c:
+            st.markdown(
+                f'<div style="font-size:11px;font-weight:700;color:#1B2B4B;'
+                f'letter-spacing:.06em;text-transform:uppercase;padding:4px 0;'
+                f'border-bottom:2px solid #1B2B4B;">{_hdr}</div>',
+                unsafe_allow_html=True)
+
+    _entity_totals = {}
     for _entity_name in ["Stores", "Ventures"]:
-        _entity_rows = [r for r in _acct_balances if r["entity"] == _entity_name]
-        for _ar in _entity_rows:
-            _pill_cls = "abs-stores" if _entity_name == "Stores" else "abs-ventures"
-            _abs_rows_html += (
-                f'<tr>'
-                f'<td><span class="abs-pill {_pill_cls}">{_entity_name}</span></td>'
-                f'<td>{_ar["bank_id"]}</td>'
-                f'<td>{_ar["bank"]}</td>'
-                f'<td>{_ar["purpose"]}</td>'
-                f'<td class="abs-bal">₹{_ar["balance"]:,.0f}</td>'
-                f'</tr>'
-            )
-        _sub = _render_entity_subtotal(
-            _acct_balances, _entity_name,
-            manual_totals=_manual_totals,
-            inv_register=get_investment_register(),
-        )
-        _abs_rows_html += (
-            f'<tr class="abs-subtotal">'
-            f'<td colspan="4">{_entity_name} Subtotal (Bank + Inv)</td>'
-            f'<td class="abs-bal">₹{_sub:,.0f}</td>'
-            f'</tr>'
+        _entity_rows      = [r for r in _acct_balances if r["entity"] == _entity_name]
+        _entity_bank_total = sum(r["balance"] for r in _entity_rows)
+        _entity_totals[_entity_name] = _render_entity_subtotal(
+            _entity_name, _entity_bank_total, _entity_rows, inv_bals
         )
 
-    _bank_subtotal = sum(r["balance"] for r in _acct_balances)
-    _grand_total   = _bank_subtotal + _cash_at_stores + _fd_total_hdr + _mf_total_hdr + _manual_inv_net
-
-    _abs_rows_html += (
-        f'<tr class="abs-subtotal">'
-        f'<td colspan="4">Cash at Stores</td>'
-        f'<td class="abs-bal">₹{_cash_at_stores:,.0f}</td>'
-        f'</tr>'
-        f'<tr class="abs-subtotal">'
-        f'<td colspan="4">Fixed Deposits (FD)</td>'
-        f'<td class="abs-bal">₹{_fd_total_hdr:,.0f}</td>'
-        f'</tr>'
-        f'<tr class="abs-subtotal">'
-        f'<td colspan="4">Mutual Funds (MF)</td>'
-        f'<td class="abs-bal">₹{_mf_total_hdr:,.0f}</td>'
-        f'</tr>'
-        f'<tr class="abs-subtotal">'
-        f'<td colspan="4">Manual Investments (Net)</td>'
-        f'<td class="abs-bal">₹{_manual_inv_net:,.0f}</td>'
-        f'</tr>'
-        f'<tr class="abs-total">'
-        f'<td colspan="4">TOTAL CASH POSITION</td>'
-        f'<td class="abs-bal">₹{_grand_total:,.0f}</td>'
-        f'</tr>'
-    )
-
-    st.markdown(f"""
-<table class="abs-table">
-  <thead>
-    <tr>
-      <th>Entity</th><th>Account ID</th><th>Bank</th><th>Purpose</th><th style="text-align:right;">Balance</th>
-    </tr>
-  </thead>
-  <tbody>
-    {_abs_rows_html}
-  </tbody>
-</table>
-""", unsafe_allow_html=True)
+    _grand_total = sum(_entity_totals.values()) + _cash_at_stores
+    st.markdown(
+        f'<div style="background:#1B2B4B;color:#fff;padding:8px 12px;'
+        f'border-radius:6px;font-weight:800;font-size:14px;'
+        f'display:flex;justify-content:space-between;">'
+        f'<span>TOTAL CASH POSITION</span>'
+        f'<span>₹{_grand_total:,.0f}</span></div>',
+        unsafe_allow_html=True)
     st.markdown("<br>", unsafe_allow_html=True)
 
     # ── Charts row ────────────────────────────────────────────────────────────
@@ -3833,21 +3862,76 @@ elif selected_tab == "Investments":
     fds = [r for r in inv_data if r["scheme_type"] == "FD"]
     mfs = [r for r in inv_data if r["scheme_type"] == "MF"]
 
-    # ── Summary KPI strip ─────────────────────────────────────────────────────
-    total_opening  = sum(r["opening_value"]  for r in inv_data)
-    total_invested = sum(r["invested"]       for r in inv_data)
-    total_redeemed = sum(r["redeemed"]       for r in inv_data)
-    total_current  = sum(r["current_value"]  for r in inv_data)
-    total_movement = total_current - total_opening
+    # ── Import from Excel ─────────────────────────────────────────────────────
+    with st.expander("📥 Import Investments from Excel", expanded=False):
+        _dl_col, _up_col = st.columns([1, 2])
+        with _dl_col:
+            import io as _io
+            import pandas as _pde
+            _tmpl_df = _pde.DataFrame(columns=[
+                "Date", "Scheme Name", "Scheme Number",
+                "Type", "Amount", "Entry Type", "Entity",
+            ])
+            _tmpl_buf = _io.BytesIO()
+            _tmpl_df.to_excel(_tmpl_buf, index=False)
+            _tmpl_buf.seek(0)
+            st.download_button(
+                "⬇ Download Template",
+                data=_tmpl_buf,
+                file_name="investment_import_template.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                use_container_width=True,
+            )
+        with _up_col:
+            _inv_upload = st.file_uploader(
+                "Upload filled Excel",
+                type=["xlsx", "xls"],
+                key="inv_excel_upload",
+            )
+            if _inv_upload is not None:
+                if st.button("📤 Import", key="inv_do_import", use_container_width=True):
+                    import tempfile as _tf, os as _osi
+                    with _tf.NamedTemporaryFile(delete=False, suffix=".xlsx") as _tmp:
+                        _tmp.write(_inv_upload.getvalue())
+                        _tmp_path = _tmp.name
+                    _result = import_investment_excel(_tmp_path)
+                    try:
+                        _osi.unlink(_tmp_path)
+                    except Exception:
+                        pass
+                    if _result["errors"] == 0 and _result["skipped"] == 0:
+                        st.success(f"Imported {_result['inserted']} rows successfully.")
+                    else:
+                        st.warning(
+                            f"Inserted: {_result['inserted']} · "
+                            f"Skipped: {_result['skipped']} · "
+                            f"Errors: {_result['errors']}"
+                        )
+                        for _err in _result["error_rows"][:10]:
+                            st.caption(_err)
+                    if _result["inserted"] > 0:
+                        st.cache_data.clear()
+                        try:
+                            st.rerun()
+                        except AttributeError:
+                            st.experimental_rerun()
 
-    k1, k2, k3, k4, k5 = st.columns(5)
+    # ── Summary KPI strip ─────────────────────────────────────────────────────
+    _inv_kpis   = get_investment_kpis(
+        entity=inv_entity if inv_entity != "All" else None
+    )
+    _ik_opening = _inv_kpis["opening"]
+    _ik_mf      = _inv_kpis["mf_balance"]
+    _ik_fd      = _inv_kpis["fd_balance"]
+    _ik_closing = _inv_kpis["closing"]
+    _ik_cls     = "#16A34A" if _ik_closing >= _ik_opening else "#DC2626"
+
+    k1, k2, k3, k4 = st.columns(4)
     for _col, _label, _value, _color in [
-        (k1, "Opening Value",   total_opening,  "#1B2B4B"),
-        (k2, "New Investments", total_invested, "#1E40AF"),
-        (k3, "Redemptions",     total_redeemed, "#9D174D"),
-        (k4, "Current Value",   total_current,  "#1B2B4B"),
-        (k5, "Net Movement",    total_movement,
-         "#16A34A" if total_movement >= 0 else "#DC2626"),
+        (k1, "OPENING BALANCE", _ik_opening, "#1B2B4B"),
+        (k2, "MUTUAL FUND",     _ik_mf,      "#5B21B6"),
+        (k3, "FIXED DEPOSIT",   _ik_fd,      "#1E40AF"),
+        (k4, "CLOSING BALANCE", _ik_closing, _ik_cls),
     ]:
         with _col:
             st.markdown(f"""
