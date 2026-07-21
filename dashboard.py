@@ -1756,11 +1756,16 @@ ventures_bank_asof = _cached_bank_asof("Ventures", as_of_date)
 stores_inv_asof    = _cached_inv_asof("Stores",    as_of_date)
 ventures_inv_asof  = _cached_inv_asof("Ventures",  as_of_date)
 
-_cash_at_stores = get_cash_asof("Stores", as_of_date)
-cash_total      = _cash_at_stores
+stores_cash_asof   = get_cash_asof("Stores",   as_of_date)
+ventures_cash_asof = get_cash_asof("Ventures", as_of_date)
+
+# Investments displayed in banner now includes cash
+stores_investments_display   = stores_inv_asof + stores_cash_asof
+ventures_investments_display = ventures_inv_asof + ventures_cash_asof
 
 total_cash_position = (stores_bank_asof + ventures_bank_asof +
-                       stores_inv_asof + ventures_inv_asof + cash_total)
+                       stores_investments_display +
+                       ventures_investments_display)
 
 as_of_display = datetime.date.fromisoformat(as_of_date).strftime("%d %b %Y")
 
@@ -1903,7 +1908,7 @@ st.markdown(f"""
                         {fmt_cr(stores_bank_asof)}</td>
                     <td style="padding:6px 0; color:#93C5FD;
                         font-size:14px; font-weight:700; text-align:right;">
-                        {fmt_cr(stores_inv_asof)}</td>
+                        {fmt_cr(stores_investments_display)}</td>
                 </tr>
                 <tr>
                     <td style="padding:6px 12px 0 0; color:#FFFFFF;
@@ -1913,7 +1918,7 @@ st.markdown(f"""
                         {fmt_cr(ventures_bank_asof)}</td>
                     <td style="padding:6px 0 0 0; color:#93C5FD;
                         font-size:14px; font-weight:700; text-align:right;">
-                        {fmt_cr(ventures_inv_asof)}</td>
+                        {fmt_cr(ventures_investments_display)}</td>
                 </tr>
             </table>
         </div>
@@ -2037,6 +2042,19 @@ if selected_tab == "Summary":
                         st.markdown(_v, unsafe_allow_html=True)
                 entity_total += _inv
 
+            # Cash Balance row — only when no specific bank account filter is active
+            cash_bal = get_cash_asof(entity_name, as_of_date)
+            if cash_bal:
+                cash_cols_row = st.columns([2, 1.5, 1.5, 1, 2])
+                for _c, _v in zip(cash_cols_row, [
+                    f'<span class="abs-pill" style="background:#CFFAFE;color:#0891B2;">CASH</span> {entity_name}',
+                    "Cash", "Cash at Stores", "—",
+                    f'<div style="text-align:right;color:#0891B2;font-weight:700;">₹{cash_bal:,.0f}</div>',
+                ]):
+                    with _c:
+                        st.markdown(_v, unsafe_allow_html=True)
+                entity_total += cash_bal
+
         st.markdown(
             f'<div style="background:#F0F4FF;padding:6px 12px;border-radius:6px;'
             f'font-weight:700;color:#1B2B4B;display:flex;justify-content:space-between;'
@@ -2083,8 +2101,6 @@ if selected_tab == "Summary":
         )
 
     _grand_total = sum(_entity_totals.values())
-    if (not abs_entity_filter or abs_entity_filter == "Stores") and not abs_bank_filter:
-        _grand_total += _cash_at_stores
 
     st.markdown(
         f'<div style="background:#1B2B4B;color:#fff;padding:8px 12px;'
@@ -3945,79 +3961,52 @@ elif selected_tab == "Investments":
                         except AttributeError:
                             st.experimental_rerun()
 
-    # ── Cash at Stores — date-aware entry with audit trail ───────────────────
+    # ── Cash at Stores — date-aware entry (Entity-selectable) ────────────────
     st.markdown("#### 💵 Cash at Stores")
 
-    cash_cols = st.columns([1.3, 1, 1, 1])
+    cash_cols = st.columns([1, 1.3, 1, 1, 1])
 
     with cash_cols[0]:
+        cash_entity_pick = st.selectbox(
+            "Entity", ["Stores", "Ventures"], key="cash_entity_pick"
+        )
+
+    with cash_cols[1]:
         entry_date_pick = st.date_input(
             "Date", value=_today,
             key="cash_entry_date", format="DD/MM/YYYY"
         )
 
-    current_val = get_cash_asof("Stores", str(entry_date_pick))
+    current_val = get_cash_asof(cash_entity_pick, str(entry_date_pick))
 
-    with cash_cols[1]:
+    with cash_cols[2]:
         st.markdown(f"""
     <div style="background:#FFFFFF; border-radius:10px;
          padding:12px 16px; border:1px solid #E8ECF0;
          border-top:3px solid #1B2B4B;">
         <div style="font-size:10px; font-weight:700; color:#8896A5;
              text-transform:uppercase; margin-bottom:4px;">
-            VALUE ON {entry_date_pick.strftime('%d %b %Y')}</div>
+            {cash_entity_pick.upper()} · {entry_date_pick.strftime('%d %b %Y')}</div>
         <div style="font-size:18px; font-weight:700; color:#1B2B4B;">
             {fmt_inr(current_val)}</div>
     </div>
     """, unsafe_allow_html=True)
 
-    with cash_cols[2]:
+    with cash_cols[3]:
         new_cash = st.number_input(
             "New Value (₹)", min_value=0.0, step=10000.0,
             value=float(current_val or 0), key="cash_input_v2"
         )
 
-    with cash_cols[3]:
+    with cash_cols[4]:
         st.markdown("<br>", unsafe_allow_html=True)
         if st.button("💾 Save", key="save_cash_v2"):
-            set_cash_entry("Stores", str(entry_date_pick), new_cash)
+            set_cash_entry(cash_entity_pick, str(entry_date_pick), new_cash)
             st.success(
-                f"✅ Cash at Stores for {entry_date_pick.strftime('%d %b %Y')} "
+                f"✅ {cash_entity_pick} cash for {entry_date_pick.strftime('%d %b %Y')} "
                 f"set to {fmt_inr(new_cash)}")
             st.cache_data.clear()
             st.rerun()
-
-    # ── Cash at Stores — audit trail ──────────────────────────────────────────
-    st.markdown("##### 📋 Cash at Stores — History")
-    cash_hist = get_cash_history("Stores")
-
-    if not cash_hist:
-        st.info("No entries yet.")
-    else:
-        for h in cash_hist[:30]:  # show last 30 entries
-            h_cols = st.columns([1.5, 2, 1.5, 0.8])
-            with h_cols[0]:
-                st.markdown(
-                    f'<div style="font-size:12px; padding:4px 0;">'
-                    f'{h["entry_date"]}</div>', unsafe_allow_html=True)
-            with h_cols[1]:
-                st.markdown(
-                    f'<div style="font-size:13px; font-weight:600; '
-                    f'padding:4px 0;">{fmt_inr(h["value"])}</div>',
-                    unsafe_allow_html=True)
-            with h_cols[2]:
-                st.markdown(
-                    f'<div style="font-size:11px; color:#8896A5; '
-                    f'padding:4px 0;">Updated: {h["updated_at"][:16]}</div>',
-                    unsafe_allow_html=True)
-            with h_cols[3]:
-                if st.button("🗑️", key=f"del_cash_{h['id']}"):
-                    delete_cash_entry(h["id"])
-                    st.cache_data.clear()
-                    st.rerun()
-
-        if len(cash_hist) > 30:
-            st.caption(f"Showing 30 of {len(cash_hist)} entries.")
 
     st.markdown("<br>", unsafe_allow_html=True)
 
@@ -4309,6 +4298,54 @@ elif selected_tab == "Investments":
         <b style="font-size:13px;color:{_mt_color};">Net: {fmt_inr(_mt_net)}</b>
     </div>
 </div>""", unsafe_allow_html=True)
+
+    # ── Cash at Stores — audit trail (entity-filterable) ─────────────────────
+    st.markdown("##### 📋 Cash at Stores — History")
+
+    hist_entity_filter = st.selectbox(
+        "Filter by entity", ["All", "Stores", "Ventures"],
+        key="cash_hist_entity_filter"
+    )
+
+    cash_hist = get_cash_history(
+        hist_entity_filter if hist_entity_filter != "All" else None
+    )
+
+    if not cash_hist:
+        st.info("No entries yet.")
+    else:
+        for h in cash_hist[:30]:
+            h_cols = st.columns([1, 1.3, 1.7, 1.3, 0.8])
+            with h_cols[0]:
+                st.markdown(
+                    f'<div style="font-size:12px; padding:4px 0;">'
+                    f'<span style="background:#EBF4FF; padding:2px 8px; '
+                    f'border-radius:10px; font-size:11px; font-weight:600;">'
+                    f'{h["entity"]}</span></div>', unsafe_allow_html=True)
+            with h_cols[1]:
+                st.markdown(
+                    f'<div style="font-size:12px; padding:4px 0;">'
+                    f'{h["entry_date"]}</div>', unsafe_allow_html=True)
+            with h_cols[2]:
+                st.markdown(
+                    f'<div style="font-size:13px; font-weight:600; '
+                    f'padding:4px 0;">{fmt_inr(h["value"])}</div>',
+                    unsafe_allow_html=True)
+            with h_cols[3]:
+                st.markdown(
+                    f'<div style="font-size:11px; color:#8896A5; '
+                    f'padding:4px 0;">Updated: {h["updated_at"][:16]}</div>',
+                    unsafe_allow_html=True)
+            with h_cols[4]:
+                if st.button("🗑️", key=f"del_cash_{h['id']}"):
+                    delete_cash_entry(h["id"])
+                    st.cache_data.clear()
+                    st.rerun()
+
+        if len(cash_hist) > 30:
+            st.caption(f"Showing 30 of {len(cash_hist)} entries.")
+
+    st.markdown("<br>", unsafe_allow_html=True)
 
     # ── B5: Transaction tagging ───────────────────────────────────────────────
     st.markdown("---")
