@@ -25,6 +25,9 @@ from database import (
     get_entity_closing_balance, get_summary_with_bank,
     import_investment_excel, get_investment_kpis,
     get_entity_investment_balances,
+    get_entity_bank_balance_asof,
+    get_entity_investment_asof,
+    get_latest_data_date,
 )
 from config import ENTITIES, LARGE_DEBIT_THRESHOLD, DATABASE_FILE
 
@@ -1567,52 +1570,21 @@ _today          = datetime.date.today()
 _first_of_month = _today.replace(day=1)
 
 # ─── Sidebar ───────────────────────────────────────────────────────────────────
-import os as _os, base64 as _b64
+import os as _os
 LOGO_PATH = _os.path.join(_os.path.dirname(__file__), "logo.png")
-_logo_display_path = LOGO_PATH
 if not _os.path.exists(LOGO_PATH):
     _fallback = _os.path.join(_os.path.dirname(__file__), "citykart_logo.png")
-    _logo_display_path = _fallback if _os.path.exists(_fallback) else None
+    if _os.path.exists(_fallback):
+        LOGO_PATH = _fallback
 
-if _logo_display_path:
-    with open(_logo_display_path, "rb") as _lf:
-        _logo_b64 = _b64.b64encode(_lf.read()).decode()
-    st.sidebar.markdown(f"""
-<div style="padding:10px 0 14px 0;text-align:center;">
-  <img src="data:image/png;base64,{_logo_b64}"
-       style="max-width:80%;max-height:56px;object-fit:contain;border-radius:6px;" />
-</div>
-""", unsafe_allow_html=True)
+if _os.path.exists(LOGO_PATH):
+    st.sidebar.image(LOGO_PATH, use_container_width=True)
 else:
-    st.sidebar.markdown("""
-<div style="
-    width:100%;height:56px;
-    background:var(--bg-inset,#F0F3F8);
-    border:1.5px dashed var(--border-md,#C8D3E0);
-    border-radius:10px;
-    display:flex;align-items:center;justify-content:center;
-    gap:8px;margin-bottom:14px;
-    color:var(--tx-4,#96A3B4);font-size:11px;font-weight:600;
-    letter-spacing:0.08em;text-transform:uppercase;
-">
-  <span style="opacity:0.5;">🏦</span> Add logo.png
-</div>
-""", unsafe_allow_html=True)
-
-with st.sidebar.expander("🖼 Update Logo", expanded=False):
-    _logo_upload_sb = st.file_uploader(
-        "Upload PNG logo", type=["png", "jpg", "jpeg"], key="logo_upload_sb"
-    )
-    if _logo_upload_sb is not None:
-        if st.button("💾 Save Logo", key="logo_save_sb"):
-            with open(LOGO_PATH, "wb") as _lw:
-                _lw.write(_logo_upload_sb.getvalue())
-            st.success("Logo saved as logo.png — persists after restart.")
-            st.cache_data.clear()
-            try:
-                st.rerun()
-            except AttributeError:
-                st.experimental_rerun()
+    st.sidebar.markdown("""<div style="width:100%; height:64px;
+        background:#F0F4FF; border:2px dashed #CBD5E0; border-radius:8px;
+        display:flex; align-items:center; justify-content:center;
+        color:#8892A4; font-size:12px;">LOGO PLACEHOLDER</div>""",
+        unsafe_allow_html=True)
 
 # ── Derive default FY from latest transaction date in DB ──────────────────────
 @st.cache_data(ttl=300)
@@ -1765,27 +1737,35 @@ else:
     closing_date    = ""
     _cb_sub         = "No transactions"
 
-# B1 — entity balances for header KPI strip (always unfiltered / live)
-stores_bal    = _cached_entity_balance("Stores")
-ventures_bal  = _cached_entity_balance("Ventures")
-inv_bals      = _cached_inv_bals()
-stores_bank   = stores_bal
-ventures_bank = ventures_bal
-stores_mf     = inv_bals["Stores"]["mf_balance"]
-stores_fd     = inv_bals["Stores"]["fd_balance"]
-ventures_mf   = inv_bals["Ventures"]["mf_balance"]
-ventures_fd   = inv_bals["Ventures"]["fd_balance"]
+# ── Date-aware header band computation ────────────────────────────────────────
+_latest_data_date = get_latest_data_date() or str(datetime.date.today())
+if use_date_range and sel_date_to:
+    as_of_date = str(sel_date_to)
+else:
+    as_of_date = _latest_data_date
 
-# ─── Cash at Stores + investment totals for header TOTAL CASH POSITION ────────
-_cash_at_stores  = get_cash_at_stores()
-_inv_hdr         = _cached_inv_header_totals()
-_fd_total_hdr    = _inv_hdr["fd"]
-_mf_total_hdr    = _inv_hdr["mf"]
-_manual_totals   = get_manual_investment_totals()
-_manual_inv_net  = sum((t["invested"] or 0) - (t["redeemed"] or 0) for t in _manual_totals)
-_total_cash_pos  = (stores_bank + ventures_bank +
-                    stores_mf + ventures_mf +
-                    stores_fd + ventures_fd + _cash_at_stores)
+@st.cache_data(ttl=60)
+def _cached_bank_asof(entity, as_of):
+    return get_entity_bank_balance_asof(entity, as_of)
+
+@st.cache_data(ttl=60)
+def _cached_inv_asof(entity, as_of):
+    return get_entity_investment_asof(entity, as_of)
+
+stores_bank_asof   = _cached_bank_asof("Stores",   as_of_date)
+ventures_bank_asof = _cached_bank_asof("Ventures", as_of_date)
+stores_inv_asof    = _cached_inv_asof("Stores",    as_of_date)
+ventures_inv_asof  = _cached_inv_asof("Ventures",  as_of_date)
+
+# Also keep unfiltered inv_bals for Account Balance Summary
+inv_bals        = _cached_inv_bals()
+_cash_at_stores = get_cash_at_stores()
+cash_total      = _cash_at_stores
+
+total_cash_position = (stores_bank_asof + ventures_bank_asof +
+                       stores_inv_asof + ventures_inv_asof + cash_total)
+
+as_of_display = datetime.date.fromisoformat(as_of_date).strftime("%d %b %Y")
 
 # ─── Transaction count (lightweight SQL COUNT — no row loading) ───────────────
 txn_count = _cached_count(sel_entity, sel_bank, sel_month, None)
@@ -1887,42 +1867,47 @@ st.markdown(f"""
             <span class="pill pill-period">📅 {period_label}</span>
         </div>
     </div>
-    <div class="kpi-strip-divider"></div>
-    <div class="kpi-strip">
-        <div class="kpi-strip-hero">
-            <div class="kpi-strip-label">TOTAL CASH POSITION</div>
-            <div style="font-size:36px;font-weight:800;color:#FFFFFF;letter-spacing:-1.2px;line-height:1;margin-bottom:3px;">{fmt_cr(_total_cash_pos)}</div>
-            <div class="kpi-strip-sub kpi-neutral">Bank {fmt_cr(closing_balance)} · Cash {fmt_cr(_cash_at_stores)} · FD {fmt_cr(stores_fd+ventures_fd)} · MF {fmt_cr(stores_mf+ventures_mf)}</div>
-        </div>
-        <div class="kpi-strip-item">
-            <div class="kpi-strip-label">STORES BANK</div>
-            <div class="kpi-strip-value">{fmt_cr(stores_bank)}</div>
-            <div class="kpi-strip-sub kpi-neutral">Bank closing · All accounts</div>
-        </div>
-        <div class="kpi-strip-item">
-            <div class="kpi-strip-label">STORES MF</div>
-            <div class="kpi-strip-value" style="color:#A78BFA;">{fmt_cr(stores_mf)}</div>
-            <div class="kpi-strip-sub kpi-neutral">Mutual funds · Stores</div>
-        </div>
-        <div class="kpi-strip-item">
-            <div class="kpi-strip-label">STORES FD</div>
-            <div class="kpi-strip-value" style="color:#60A5FA;">{fmt_cr(stores_fd)}</div>
-            <div class="kpi-strip-sub kpi-neutral">Fixed deposits · Stores</div>
-        </div>
-        <div class="kpi-strip-item">
-            <div class="kpi-strip-label">VENTURES BANK</div>
-            <div class="kpi-strip-value">{fmt_cr(ventures_bank)}</div>
-            <div class="kpi-strip-sub kpi-neutral">Bank closing · All accounts</div>
-        </div>
-        <div class="kpi-strip-item">
-            <div class="kpi-strip-label">VENTURES MF</div>
-            <div class="kpi-strip-value" style="color:#A78BFA;">{fmt_cr(ventures_mf)}</div>
-            <div class="kpi-strip-sub kpi-neutral">Mutual funds · Ventures</div>
-        </div>
-        <div class="kpi-strip-item">
-            <div class="kpi-strip-label">VENTURES FD</div>
-            <div class="kpi-strip-value" style="color:#60A5FA;">{fmt_cr(ventures_fd)}</div>
-            <div class="kpi-strip-sub kpi-neutral">Fixed deposits · Ventures</div>
+    <div style="margin-top:16px;">
+        <div style="background:#1B2B4B; border-radius:12px; padding:24px 28px;">
+            <div style="font-size:11px; font-weight:700; color:#8896A5;
+                 letter-spacing:0.1em; text-transform:uppercase;
+                 margin-bottom:4px;">TOTAL CASH POSITION · AS ON {as_of_display}</div>
+            <div style="font-size:36px; font-weight:800; color:#FFFFFF;
+                 letter-spacing:-1px; margin-bottom:20px;">
+                {fmt_cr(total_cash_position)}
+            </div>
+            <table style="width:100%; border-collapse:collapse;">
+                <tr style="border-bottom:1px solid rgba(255,255,255,0.15);">
+                    <td style="padding:8px 0; color:#8896A5; font-size:12px;
+                        font-weight:700; text-transform:uppercase;">Entity</td>
+                    <td style="padding:8px 0; color:#8896A5; font-size:12px;
+                        font-weight:700; text-transform:uppercase;
+                        text-align:right;">Bank Balance</td>
+                    <td style="padding:8px 0; color:#8896A5; font-size:12px;
+                        font-weight:700; text-transform:uppercase;
+                        text-align:right;">Investments</td>
+                </tr>
+                <tr>
+                    <td style="padding:10px 0; color:#FFFFFF; font-size:15px;
+                        font-weight:600;">Stores</td>
+                    <td style="padding:10px 0; color:#FFFFFF; font-size:15px;
+                        font-weight:700; text-align:right;">
+                        {fmt_cr(stores_bank_asof)}</td>
+                    <td style="padding:10px 0; color:#93C5FD; font-size:15px;
+                        font-weight:700; text-align:right;">
+                        {fmt_cr(stores_inv_asof)}</td>
+                </tr>
+                <tr>
+                    <td style="padding:10px 0; color:#FFFFFF; font-size:15px;
+                        font-weight:600;">Ventures</td>
+                    <td style="padding:10px 0; color:#FFFFFF; font-size:15px;
+                        font-weight:700; text-align:right;">
+                        {fmt_cr(ventures_bank_asof)}</td>
+                    <td style="padding:10px 0; color:#93C5FD; font-size:15px;
+                        font-weight:700; text-align:right;">
+                        {fmt_cr(ventures_inv_asof)}</td>
+                </tr>
+            </table>
         </div>
     </div>
 </div>
@@ -2974,6 +2959,21 @@ elif selected_tab == "Exception Report":
             from inflow/outflow calculations.
         </div>""", unsafe_allow_html=True)
 
+    st.markdown("---")
+    with st.expander("🖼️ Update Logo", expanded=False):
+        logo_file = st.file_uploader(
+            "Upload logo (PNG/JPG)", type=["png", "jpg", "jpeg"],
+            accept_multiple_files=False, key="logo_uploader_exc")
+        if st.button("💾 Save Logo", key="save_logo_btn_exc"):
+            if logo_file is not None:
+                with open(LOGO_PATH, "wb") as _lf_w:
+                    _lf_w.write(logo_file.getbuffer())
+                st.success("✅ Logo saved. Refreshing...")
+                st.cache_data.clear()
+                st.rerun()
+            else:
+                st.warning("Please select a file first.")
+
 # ══════════════════════════════════════════════════════════════════════════════
 # CASH FLOW
 # ══════════════════════════════════════════════════════════════════════════════
@@ -2987,35 +2987,22 @@ elif selected_tab == "Cash Flow":
         if _k not in st.session_state:
             st.session_state[_k] = False
 
-    # ── Styled filter bar ─────────────────────────────────────────────────────
-    st.markdown("""
-<div class="cf-control-bar">
-  <div class="cf-bar-label">Cash Flow Statement</div>
-""", unsafe_allow_html=True)
+    # ── Drive from sidebar ────────────────────────────────────────────────────
+    cf_entity = None if sel_entity == "All" else sel_entity
 
-    _cc1, _cc2, _cc3, _cc4 = st.columns([2, 2, 1.5, 1.5])
-    with _cc1:
-        st.markdown('<p style="color:rgba(255,255,255,0.6);font-size:13px;font-weight:600;margin-bottom:2px;">ENTITY</p>', unsafe_allow_html=True)
-        cf_ent = st.radio("", ["All", "Stores", "Ventures"], horizontal=True, key="cf_ent_radio", label_visibility="collapsed")
-    with _cc2:
-        st.markdown('<p style="color:rgba(255,255,255,0.6);font-size:13px;font-weight:600;margin-bottom:2px;">VIEW</p>', unsafe_allow_html=True)
-        cf_view = st.radio("", ["Monthly", "Weekly"], horizontal=True, key="cf_view_radio", label_visibility="collapsed")
-    with _cc3:
-        st.markdown('<p style="color:rgba(255,255,255,0.6);font-size:13px;font-weight:600;margin-bottom:2px;">FROM</p>', unsafe_allow_html=True)
-        cf_from = st.date_input("", format="DD/MM/YYYY", key="cf_from",
-                                label_visibility="collapsed")
-    with _cc4:
-        st.markdown('<p style="color:rgba(255,255,255,0.6);font-size:13px;font-weight:600;margin-bottom:2px;">TO</p>', unsafe_allow_html=True)
-        cf_to = st.date_input("", format="DD/MM/YYYY", key="cf_to",
-                              label_visibility="collapsed")
+    if use_date_range and sel_date_from and sel_date_to:
+        cf_month_from = str(sel_date_from)
+        cf_month_to   = str(sel_date_to)
+    else:
+        _cf_latest    = get_latest_data_date() or str(datetime.date.today())
+        _cf_latest_dt = datetime.date.fromisoformat(_cf_latest)
+        cf_month_from = str(_cf_latest_dt.replace(day=1))
+        cf_month_to   = str(_cf_latest_dt)
 
-    st.markdown('</div>', unsafe_allow_html=True)
-
-    # Safe fallback — session state may be None on very first render before FY reset
-    if cf_from is None:
-        cf_from = _fy_s
-    if cf_to is None:
-        cf_to = _today
+    if use_date_range and sel_date_to:
+        week_anchor = sel_date_to
+    else:
+        week_anchor = datetime.date.today()
 
     # ── Expand / Collapse All ─────────────────────────────────────────────────
     # Match section toggles (_open suffix) and group toggles (_grp_ in key)
@@ -3042,11 +3029,10 @@ elif selected_tab == "Cash Flow":
             st.rerun()
 
     # ── Data fetch ────────────────────────────────────────────────────────────
-    def _get_cf(d_from, d_to):
-        """Fetch cash flow; passes entity=None for All (triggers IC netting in fetch_cf)."""
+    def _get_cf(d_from, d_to, financial_year=None):
+        """Fetch cash flow; entity=None for All (triggers IC netting in fetch_cf)."""
         ds, de = str(d_from), str(d_to)
-        ent = None if cf_ent == "All" else cf_ent
-        return fetch_cf(ent, ds, de, DATABASE_FILE, financial_year=None)
+        return fetch_cf(cf_entity, ds, de, DATABASE_FILE, financial_year=None)
 
     # ── Collapsible section helper ────────────────────────────────────────────
     def _cf_section(label, total, line_items, toggle_key, btn_key,
@@ -3095,8 +3081,15 @@ elif selected_tab == "Cash Flow":
     # ─────────────────────────────────────────────────────────────────────────
     # MONTHLY VIEW
     # ─────────────────────────────────────────────────────────────────────────
-    if cf_view == "Monthly":
-        cf = _get_cf(cf_from, cf_to)
+    if True:  # Monthly — always shown
+        st.markdown(f"""
+<div style="background:#1B2B4B; color:#FFFFFF; border-radius:8px;
+     padding:10px 20px; margin:16px 0 8px 0; font-size:13px;
+     font-weight:700; letter-spacing:0.05em;">
+    CASH FLOW STATEMENT · {cf_month_from} to {cf_month_to}
+</div>
+""", unsafe_allow_html=True)
+        cf = _get_cf(cf_month_from, cf_month_to, financial_year=None)
 
         # Uncategorized always last
         receipts_ordered = {k: v for k, v in cf["receipts"].items() if k != "Uncategorized"}
@@ -3250,9 +3243,9 @@ elif selected_tab == "Cash Flow":
         # (closing is now computed, so compare against DB to detect data gaps)
         _tally     = cf["total_closing"]
         _db_actual = get_closing_balance(
-            entity=cf_ent if cf_ent != "All" else None,
+            entity=cf_entity,
             date_from="1900-01-01",
-            date_to=str(cf_to),
+            date_to=str(cf_month_to),
         )["total"] or 0
         _diff   = round(_tally - _db_actual, 2)
         _t_ok   = abs(_diff) <= 1
@@ -3332,7 +3325,7 @@ elif selected_tab == "Cash Flow":
                 wb.save(out)
                 return out.getvalue()
 
-            _xl_fname = (f"cashflow_{cf_ent}_{cf_from}_{cf_to}.xlsx"
+            _xl_fname = (f"cashflow_{cf_entity or 'All'}_{cf_month_from}_{cf_month_to}.xlsx"
                          .replace(" ", "_").replace("/", "-"))
             st.download_button(
                 "⬇️ Export Excel", _build_excel_monthly(),
@@ -3344,12 +3337,18 @@ elif selected_tab == "Cash Flow":
     # ─────────────────────────────────────────────────────────────────────────
     # WEEKLY VIEW
     # ─────────────────────────────────────────────────────────────────────────
-    else:
-        # W4 = current week Mon → today (inclusive, Live)
-        # W1-W3 = three complete Mon-Sun weeks immediately before W4
-        _days_since_mon = _today.weekday()  # Mon=0 … Sun=6
-        _w4_start = _today - datetime.timedelta(days=_days_since_mon)
-        _w4_end   = _today
+    if True:  # Weekly — always shown
+        st.markdown(f"""
+<div style="background:#1B2B4B; color:#FFFFFF; border-radius:8px;
+     padding:10px 20px; margin:24px 0 8px 0; font-size:13px;
+     font-weight:700; letter-spacing:0.05em;">
+    WEEKLY CASH FLOW · Last 4 weeks ending {week_anchor.strftime('%d %b %Y')}
+</div>
+""", unsafe_allow_html=True)
+        # W4 = week Mon → week_anchor (inclusive); W1-W3 = three prior complete weeks
+        _days_since_mon = week_anchor.weekday()  # Mon=0 … Sun=6
+        _w4_start = week_anchor - datetime.timedelta(days=_days_since_mon)
+        _w4_end   = week_anchor
         _w3_end   = _w4_start - datetime.timedelta(days=1)
         _w3_start = _w3_end   - datetime.timedelta(days=6)
         _w2_end   = _w3_start - datetime.timedelta(days=1)
@@ -3404,7 +3403,7 @@ elif selected_tab == "Cash Flow":
         # Tally diffs: formula-computed closing vs actual last DB balance per week
         _db_actual_close = [
             get_closing_balance(
-                entity=cf_ent if cf_ent != "All" else None,
+                entity=cf_entity,
                 date_from="1900-01-01",
                 date_to=str(_w_ranges[_wi][1]),
             )["total"] or 0

@@ -1838,5 +1838,86 @@ def get_entity_investment_balances():
     return result
 
 
+def get_entity_bank_balance_asof(entity, as_of_date):
+    """Bank balance for an entity AS ON a specific date."""
+    conn = get_connection()
+    banks = conn.execute(
+        "SELECT DISTINCT bank FROM transactions WHERE entity=?",
+        [entity]).fetchall()
+
+    total = 0
+    for b in banks:
+        bank = b["bank"]
+        row = conn.execute("""
+            SELECT balance FROM transactions
+            WHERE bank=? AND entity=?
+            AND date <= ?
+            AND final_group != 'OPENING BALANCE'
+            AND balance IS NOT NULL
+            ORDER BY date DESC, id DESC LIMIT 1
+        """, [bank, entity, as_of_date]).fetchone()
+
+        if row and row["balance"] is not None:
+            total += row["balance"]
+        else:
+            ob = conn.execute("""
+                SELECT balance FROM transactions
+                WHERE bank=? AND entity=?
+                AND final_group='OPENING BALANCE'
+                ORDER BY date DESC LIMIT 1
+            """, [bank, entity]).fetchone()
+            if ob and ob["balance"] is not None:
+                total += ob["balance"]
+
+    conn.close()
+    return total
+
+
+def get_entity_investment_asof(entity, as_of_date):
+    """Combined FD+MF value for an entity AS ON a specific date."""
+    conn = get_connection()
+
+    reg_row = conn.execute("""
+        SELECT SUM(opening_value) as total
+        FROM investment_register WHERE entity=?
+    """, [entity]).fetchone()
+    opening = (reg_row["total"] or 0) if reg_row else 0
+
+    txn_row = conn.execute("""
+        SELECT
+            ROUND(SUM(CASE WHEN debit>0  THEN debit  ELSE 0 END),2) as inv,
+            ROUND(SUM(CASE WHEN credit>0 THEN credit ELSE 0 END),2) as red
+        FROM transactions
+        WHERE entity=?
+        AND UPPER(main_group)='INVESTMENT'
+        AND date <= ?
+    """, [entity, as_of_date]).fetchone()
+    txn_net = ((txn_row["inv"] or 0) - (txn_row["red"] or 0)) if txn_row else 0
+
+    man_row = conn.execute("""
+        SELECT
+            SUM(CASE WHEN entry_type='Invested' THEN amount ELSE 0 END) as inv,
+            SUM(CASE WHEN entry_type='Redeemed' THEN amount ELSE 0 END) as red
+        FROM manual_investments
+        WHERE entity=?
+        AND entry_date <= ?
+    """, [entity, as_of_date]).fetchone()
+    man_net = ((man_row["inv"] or 0) - (man_row["red"] or 0)) if man_row else 0
+
+    conn.close()
+    return opening + txn_net + man_net
+
+
+def get_latest_data_date():
+    """Most recent transaction date in DB — used as default 'as on' date."""
+    conn = get_connection()
+    row = conn.execute("""
+        SELECT MAX(date) as latest FROM transactions
+        WHERE final_group != 'OPENING BALANCE'
+    """).fetchone()
+    conn.close()
+    return row["latest"] if row and row["latest"] else None
+
+
 if __name__ == "__main__":
     init_db()
