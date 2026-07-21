@@ -17,7 +17,9 @@ from database import (
     get_transfer_reconciliation, get_monthly_trend,
     get_yoy_comparison, get_top_expenses_comparison, get_weekly_cash_position,
     log_upload, get_upload_trail, delete_upload,
-    get_account_balances, get_cash_at_stores, set_cash_at_stores,
+    get_account_balances,
+    set_cash_entry, get_cash_asof, get_cash_history,
+    delete_cash_entry, import_cash_excel,
     get_investment_transactions, tag_investment_transaction,
     get_investment_movements,
     add_manual_investment, get_manual_investments,
@@ -1754,7 +1756,7 @@ ventures_bank_asof = _cached_bank_asof("Ventures", as_of_date)
 stores_inv_asof    = _cached_inv_asof("Stores",    as_of_date)
 ventures_inv_asof  = _cached_inv_asof("Ventures",  as_of_date)
 
-_cash_at_stores = get_cash_at_stores()
+_cash_at_stores = get_cash_asof("Stores", as_of_date)
 cash_total      = _cash_at_stores
 
 total_cash_position = (stores_bank_asof + ventures_bank_asof +
@@ -3943,31 +3945,80 @@ elif selected_tab == "Investments":
                         except AttributeError:
                             st.experimental_rerun()
 
-    # ── Cash at Stores ────────────────────────────────────────────────────────
-    st.markdown('<div class="section-header" style="margin-bottom:10px;">Cash at Stores</div>',
-                unsafe_allow_html=True)
-    _cas_col1, _cas_col2, _cas_col3 = st.columns([2, 2, 3])
-    with _cas_col1:
-        _cur_cas = get_cash_at_stores()
-        st.markdown(f"""
-<div style="background:#FFFFFF;border-radius:10px;padding:16px 20px;
-     border:1px solid #E8ECF0;border-top:3px solid #0EA5E9;
-     box-shadow:0 1px 3px rgba(0,0,0,0.04);">
-  <div style="font-size:10px;font-weight:700;color:#8896A5;letter-spacing:0.1em;
-       text-transform:uppercase;margin-bottom:6px;">Current Value</div>
-  <div style="font-size:22px;font-weight:700;color:#0EA5E9;">₹{_cur_cas:,.0f}</div>
-</div>
-""", unsafe_allow_html=True)
-    with _cas_col2:
-        _new_cas = st.number_input(
-            "Update Cash at Stores (₹)", min_value=0.0, step=1000.0,
-            value=float(get_cash_at_stores()), format="%.0f",
-            key="cas_input"
+    # ── Cash at Stores — date-aware entry with audit trail ───────────────────
+    st.markdown("#### 💵 Cash at Stores")
+
+    cash_cols = st.columns([1.3, 1, 1, 1])
+
+    with cash_cols[0]:
+        entry_date_pick = st.date_input(
+            "Date", value=_today,
+            key="cash_entry_date", format="DD/MM/YYYY"
         )
-        if st.button("Save", key="cas_save"):
-            set_cash_at_stores(_new_cas)
-            st.success(f"Saved ₹{_new_cas:,.0f}")
+
+    current_val = get_cash_asof("Stores", str(entry_date_pick))
+
+    with cash_cols[1]:
+        st.markdown(f"""
+    <div style="background:#FFFFFF; border-radius:10px;
+         padding:12px 16px; border:1px solid #E8ECF0;
+         border-top:3px solid #1B2B4B;">
+        <div style="font-size:10px; font-weight:700; color:#8896A5;
+             text-transform:uppercase; margin-bottom:4px;">
+            VALUE ON {entry_date_pick.strftime('%d %b %Y')}</div>
+        <div style="font-size:18px; font-weight:700; color:#1B2B4B;">
+            {fmt_inr(current_val)}</div>
+    </div>
+    """, unsafe_allow_html=True)
+
+    with cash_cols[2]:
+        new_cash = st.number_input(
+            "New Value (₹)", min_value=0.0, step=10000.0,
+            value=float(current_val or 0), key="cash_input_v2"
+        )
+
+    with cash_cols[3]:
+        st.markdown("<br>", unsafe_allow_html=True)
+        if st.button("💾 Save", key="save_cash_v2"):
+            set_cash_entry("Stores", str(entry_date_pick), new_cash)
+            st.success(
+                f"✅ Cash at Stores for {entry_date_pick.strftime('%d %b %Y')} "
+                f"set to {fmt_inr(new_cash)}")
+            st.cache_data.clear()
             st.rerun()
+
+    # ── Cash at Stores — audit trail ──────────────────────────────────────────
+    st.markdown("##### 📋 Cash at Stores — History")
+    cash_hist = get_cash_history("Stores")
+
+    if not cash_hist:
+        st.info("No entries yet.")
+    else:
+        for h in cash_hist[:30]:  # show last 30 entries
+            h_cols = st.columns([1.5, 2, 1.5, 0.8])
+            with h_cols[0]:
+                st.markdown(
+                    f'<div style="font-size:12px; padding:4px 0;">'
+                    f'{h["entry_date"]}</div>', unsafe_allow_html=True)
+            with h_cols[1]:
+                st.markdown(
+                    f'<div style="font-size:13px; font-weight:600; '
+                    f'padding:4px 0;">{fmt_inr(h["value"])}</div>',
+                    unsafe_allow_html=True)
+            with h_cols[2]:
+                st.markdown(
+                    f'<div style="font-size:11px; color:#8896A5; '
+                    f'padding:4px 0;">Updated: {h["updated_at"][:16]}</div>',
+                    unsafe_allow_html=True)
+            with h_cols[3]:
+                if st.button("🗑️", key=f"del_cash_{h['id']}"):
+                    delete_cash_entry(h["id"])
+                    st.cache_data.clear()
+                    st.rerun()
+
+        if len(cash_hist) > 30:
+            st.caption(f"Showing 30 of {len(cash_hist)} entries.")
+
     st.markdown("<br>", unsafe_allow_html=True)
 
     # ── B4: Investment Portfolio — movements from actual transactions ─────────
@@ -4327,6 +4378,74 @@ elif selected_tab == "Investments":
                     st.rerun()
                 else:
                     st.warning("Select rows and add scheme names first.")
+
+    # ── One-time historical Cash at Stores bulk upload ────────────────────────
+    st.markdown("---")
+    with st.expander("📤 One-Time Historical Cash Upload (Excel)", expanded=False):
+        st.caption(
+            "Upload historical Cash at Stores data since 1st April 2025. "
+            "Columns required: Entity | Date | Value. "
+            "Re-uploading the same Entity+Date will overwrite that day's value.")
+
+        _cash_tmpl_df = pd.DataFrame({
+            "Entity": ["Stores", "Stores", "Stores"],
+            "Date":   ["01/04/2025", "02/04/2025", "03/04/2025"],
+            "Value":  [26500000, 26750000, 27100000],
+        })
+        _cash_tmpl_buf = io.BytesIO()
+        _cash_tmpl_df.to_excel(_cash_tmpl_buf, index=False)
+        _cash_tmpl_buf.seek(0)
+        st.download_button(
+            "⬇️ Download Template", _cash_tmpl_buf, "cash_at_stores_template.xlsx",
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            key="dl_cash_template"
+        )
+
+        st.markdown("---")
+
+        _cash_uploader_key = st.session_state.get("cash_uploader_key", 0)
+        _cash_file = st.file_uploader(
+            "Upload Excel file", type=["xlsx", "xls"],
+            accept_multiple_files=False,
+            key=f"cash_upload_{_cash_uploader_key}"
+        )
+
+        if st.button("📥 Import Cash History", key="import_cash_btn"):
+            if _cash_file is None:
+                st.error("Please select an Excel file first.")
+            else:
+                import tempfile as _cash_tf, os as _cash_os
+                _cash_suffix = _cash_os.path.splitext(_cash_file.name)[1]
+                with _cash_tf.NamedTemporaryFile(delete=False, suffix=_cash_suffix) as _cash_tmp:
+                    _cash_tmp.write(_cash_file.getbuffer())
+                    _cash_tmp_path = _cash_tmp.name
+
+                with st.spinner("Importing..."):
+                    _cash_result = import_cash_excel(_cash_tmp_path)
+
+                try:
+                    _cash_os.unlink(_cash_tmp_path)
+                except Exception:
+                    pass
+
+                if _cash_result["inserted"] > 0:
+                    st.success(
+                        f"✅ Imported {_cash_result['inserted']:,} daily entries. "
+                        f"Skipped: {_cash_result.get('skipped', 0)}. "
+                        f"Errors: {_cash_result['errors']}.")
+                    st.session_state["cash_uploader_key"] = _cash_uploader_key + 1
+                    st.cache_data.clear()
+                    st.rerun()
+                else:
+                    st.error(
+                        f"❌ No entries imported. "
+                        f"Skipped: {_cash_result.get('skipped', 0)}. "
+                        f"Errors: {_cash_result['errors']}.")
+
+                if _cash_result.get("error_rows"):
+                    with st.expander("⚠️ Row errors"):
+                        for _err in _cash_result["error_rows"][:20]:
+                            st.text(_err)
 
 # ══════════════════════════════════════════════════════════════════════════════
 # UPLOAD

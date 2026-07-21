@@ -156,6 +156,38 @@ def init_db():
     """)
     conn.commit()
 
+    # New schema: one row per (entity, entry_date), upsert on conflict
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS cash_register_v2 (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            entity      TEXT NOT NULL DEFAULT 'Stores',
+            entry_date  TEXT NOT NULL,
+            value       REAL NOT NULL DEFAULT 0,
+            updated_at  TEXT DEFAULT (datetime('now','localtime')),
+            UNIQUE(entity, entry_date)
+        )
+    """)
+    conn.commit()
+
+    # One-time migration: carry forward old cash_register's latest value
+    # as today's entry in cash_register_v2, if v2 is empty
+    existing_v2 = conn.execute(
+        "SELECT COUNT(*) FROM cash_register_v2").fetchone()[0]
+    if existing_v2 == 0:
+        old = conn.execute("""
+            SELECT value FROM cash_register
+            ORDER BY updated_at DESC LIMIT 1
+        """).fetchone()
+        if old:
+            import datetime as _dt
+            conn.execute("""
+                INSERT OR IGNORE INTO cash_register_v2
+                (entity, entry_date, value)
+                VALUES ('Stores', ?, ?)
+            """, [str(_dt.date.today()), old["value"]])
+            conn.commit()
+            print(f"[DB] Migrated old cash_register value {old['value']} to cash_register_v2")
+
     conn.execute("""
         CREATE TABLE IF NOT EXISTS upload_trail (
             id             INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1545,24 +1577,135 @@ def get_account_balances_asof(as_of_date, entity_filter=None, bank_filter=None):
     return results
 
 
-def get_cash_at_stores():
-    """Return current Cash at Stores value (0.0 if never set)."""
+def set_cash_entry(entity, entry_date, value):
+    """Upsert cash value for a specific entity+date. Overwrites if exists."""
     conn = get_connection()
-    row = conn.execute(
-        "SELECT value FROM cash_register ORDER BY id DESC LIMIT 1"
-    ).fetchone()
-    conn.close()
-    return row["value"] if row else 0.0
-
-
-def set_cash_at_stores(value: float):
-    """Insert a new Cash at Stores entry (keeps history)."""
-    conn = get_connection()
-    conn.execute(
-        "INSERT INTO cash_register (value) VALUES (?)", [round(float(value), 2)]
-    )
+    conn.execute("""
+        INSERT INTO cash_register_v2 (entity, entry_date, value, updated_at)
+        VALUES (?, ?, ?, datetime('now','localtime'))
+        ON CONFLICT(entity, entry_date) DO UPDATE SET
+            value=excluded.value,
+            updated_at=datetime('now','localtime')
+    """, [entity, entry_date, value])
     conn.commit()
     conn.close()
+
+
+def get_cash_asof(entity, as_of_date):
+    """
+    Cash at Stores value AS ON a specific date.
+    Uses last entry on or before as_of_date (carry-forward logic,
+    same pattern as bank balance as-of).
+    """
+    conn = get_connection()
+    row = conn.execute("""
+        SELECT value FROM cash_register_v2
+        WHERE entity=? AND entry_date <= ?
+        ORDER BY entry_date DESC LIMIT 1
+    """, [entity, as_of_date]).fetchone()
+    conn.close()
+    return row["value"] if row else 0
+
+
+def get_cash_history(entity=None):
+    """Full audit trail of all cash entries, most recent first."""
+    conn = get_connection()
+    where  = ""
+    params = []
+    if entity and entity != "All":
+        where = "WHERE entity=?"
+        params = [entity]
+    rows = conn.execute(f"""
+        SELECT id, entity, entry_date, value, updated_at
+        FROM cash_register_v2
+        {where}
+        ORDER BY entry_date DESC, entity
+    """, params).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+def delete_cash_entry(entry_id):
+    conn = get_connection()
+    conn.execute("DELETE FROM cash_register_v2 WHERE id=?", [entry_id])
+    conn.commit()
+    conn.close()
+
+
+def import_cash_excel(filepath):
+    """
+    Bulk import historical cash-at-stores data.
+    Expected columns: Entity | Date | Value
+    Upserts — re-uploading same entity+date overwrites the value.
+    """
+    import pandas as pd
+
+    try:
+        df = pd.read_excel(filepath, dtype=str)
+    except Exception as e:
+        return {"inserted": 0, "errors": 1, "error_rows": [str(e)]}
+
+    df.columns = [str(c).strip() for c in df.columns]
+
+    COL_MAP = {
+        "entity": ["Entity", "ENTITY"],
+        "date":   ["Date", "DATE"],
+        "value":  ["Value", "VALUE", "Amount", "Cash Value"],
+    }
+    def find_col(cands):
+        for c in cands:
+            if c in df.columns:
+                return c
+        return None
+    cols = {k: find_col(v) for k, v in COL_MAP.items()}
+    missing = [k for k, v in cols.items() if v is None]
+    if missing:
+        return {"inserted": 0, "errors": 1,
+                "error_rows": [f"Missing columns: {missing}. Available: {list(df.columns)}"]}
+
+    conn = get_connection()
+    inserted, skipped, errors = 0, 0, 0
+    error_rows = []
+
+    for idx, row in df.iterrows():
+        try:
+            entity = str(row.get(cols["entity"]) or "").strip().title()
+            if entity not in ("Stores", "Ventures"):
+                skipped += 1
+                error_rows.append(f"Row {idx+2}: Invalid entity '{entity}'")
+                continue
+
+            date_raw = str(row.get(cols["date"]) or "").strip()
+            if not date_raw or date_raw in ("nan","None","-"):
+                skipped += 1
+                error_rows.append(f"Row {idx+2}: Missing date")
+                continue
+            entry_date = pd.to_datetime(date_raw).strftime("%Y-%m-%d")
+
+            val_raw = str(row.get(cols["value"]) or "").strip()
+            if not val_raw or val_raw in ("nan","None","-"):
+                skipped += 1
+                error_rows.append(f"Row {idx+2}: Missing value")
+                continue
+            value = float(val_raw.replace(",","").replace("₹","").strip())
+
+            conn.execute("""
+                INSERT INTO cash_register_v2 (entity, entry_date, value, updated_at)
+                VALUES (?, ?, ?, datetime('now','localtime'))
+                ON CONFLICT(entity, entry_date) DO UPDATE SET
+                    value=excluded.value,
+                    updated_at=datetime('now','localtime')
+            """, [entity, entry_date, value])
+            inserted += 1
+
+        except Exception as e:
+            errors += 1
+            error_rows.append(f"Row {idx+2}: {str(e)}")
+
+    conn.commit()
+    conn.close()
+    return {"inserted": inserted, "skipped": skipped,
+             "errors": errors, "error_rows": error_rows}
 
 
 @functools.lru_cache(maxsize=32)
