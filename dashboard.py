@@ -24,10 +24,10 @@ from database import (
     delete_manual_investment, get_manual_investment_totals,
     get_entity_closing_balance, get_summary_with_bank,
     import_investment_excel, get_investment_kpis,
-    get_entity_investment_balances,
     get_entity_bank_balance_asof,
     get_entity_investment_asof,
     get_latest_data_date,
+    get_account_balances_asof,
 )
 from config import ENTITIES, LARGE_DEBIT_THRESHOLD, DATABASE_FILE
 
@@ -108,9 +108,6 @@ def _cached_inv_header_totals():
         "mf": sum(r["current_value"] for r in _d if r["scheme_type"] == "MF"),
     }
 
-@st.cache_data(ttl=60)
-def _cached_inv_bals():
-    return get_entity_investment_balances()
 from queries.cashflow_queries import fetch_cf
 from tabs.overview import render_overview
 from tabs.review_queue import render_review_queue
@@ -1757,8 +1754,6 @@ ventures_bank_asof = _cached_bank_asof("Ventures", as_of_date)
 stores_inv_asof    = _cached_inv_asof("Stores",    as_of_date)
 ventures_inv_asof  = _cached_inv_asof("Ventures",  as_of_date)
 
-# Also keep unfiltered inv_bals for Account Balance Summary
-inv_bals        = _cached_inv_bals()
 _cash_at_stores = get_cash_at_stores()
 cash_total      = _cash_at_stores
 
@@ -2003,10 +1998,15 @@ selected_tab = st.session_state["active_tab"]
 # ══════════════════════════════════════════════════════════════════════════════
 if selected_tab == "Summary":
     st.markdown(LIVE_BANNER, unsafe_allow_html=True)
-    # ── Account Balance Summary ───────────────────────────────────────────────
-    _acct_balances = get_account_balances(financial_year=sel_fy if sel_fy != "All" else None)
+    # ── Account Balance Summary — respects Entity / Bank / Date Range filters ──
+    abs_entity_filter = sel_entity if sel_entity != "All" else None
+    abs_bank_filter   = sel_bank   if sel_bank   != "All" else None
 
-    def _render_entity_subtotal(entity_name, entity_bank_total, rows, _inv_bals):
+    _acct_balances = get_account_balances_asof(
+        as_of_date, abs_entity_filter, abs_bank_filter)
+
+    def _render_entity_subtotal(entity_name, entity_bank_total, rows,
+                                 show_investments, as_of_date):
         _pill_cls = "abs-stores" if entity_name == "Stores" else "abs-ventures"
         for acc in rows:
             rcols = st.columns([2, 1.5, 1.5, 1, 2])
@@ -2021,36 +2021,25 @@ if selected_tab == "Summary":
                 with _c:
                     st.markdown(_v, unsafe_allow_html=True)
 
-        _eb  = _inv_bals.get(entity_name, {})
-        _mf  = _eb.get("mf_balance", 0)
-        _fd  = _eb.get("fd_balance", 0)
+        entity_total = entity_bank_total
+        if show_investments:
+            _inv = get_entity_investment_asof(entity_name, as_of_date)
+            if _inv:
+                ircols = st.columns([2, 1.5, 1.5, 1, 2])
+                for _c, _v in zip(ircols, [
+                    f'<span class="abs-pill" style="background:#EDE9FE;color:#5B21B6;">INV</span> {entity_name}',
+                    "Investments", "MF + FD", "—",
+                    f'<div style="text-align:right;color:#5B21B6;font-weight:700;">₹{_inv:,.0f}</div>',
+                ]):
+                    with _c:
+                        st.markdown(_v, unsafe_allow_html=True)
+                entity_total += _inv
 
-        if _mf:
-            mrcols = st.columns([2, 1.5, 1.5, 1, 2])
-            for _c, _v in zip(mrcols, [
-                f'<span class="abs-pill" style="background:#EDE9FE;color:#5B21B6;">MF</span> {entity_name}',
-                "Mutual Fund", "Investment", "—",
-                f'<div style="text-align:right;color:#5B21B6;font-weight:700;">₹{_mf:,.0f}</div>',
-            ]):
-                with _c:
-                    st.markdown(_v, unsafe_allow_html=True)
-
-        if _fd:
-            fdcols = st.columns([2, 1.5, 1.5, 1, 2])
-            for _c, _v in zip(fdcols, [
-                f'<span class="abs-pill" style="background:#DBEAFE;color:#1E40AF;">FD</span> {entity_name}',
-                "Fixed Deposit", "Investment", "—",
-                f'<div style="text-align:right;color:#1E40AF;font-weight:700;">₹{_fd:,.0f}</div>',
-            ]):
-                with _c:
-                    st.markdown(_v, unsafe_allow_html=True)
-
-        entity_total = entity_bank_total + _mf + _fd
         st.markdown(
             f'<div style="background:#F0F4FF;padding:6px 12px;border-radius:6px;'
             f'font-weight:700;color:#1B2B4B;display:flex;justify-content:space-between;'
             f'margin-bottom:8px;">'
-            f'<span>{entity_name} Subtotal (Bank + MF + FD)</span>'
+            f'<span>{entity_name} Subtotal{" (Bank + Investments)" if show_investments else " (Bank)"}</span>'
             f'<span>₹{entity_total:,.0f}</span></div>',
             unsafe_allow_html=True)
         return entity_total
@@ -2075,15 +2064,26 @@ if selected_tab == "Summary":
                 f'border-bottom:2px solid #1B2B4B;">{_hdr}</div>',
                 unsafe_allow_html=True)
 
+    # MF/FD rows aren't tied to a single bank account — only show them when
+    # no specific Bank Account is selected.
+    show_investments = not abs_bank_filter
+    entities_to_show = [abs_entity_filter] if abs_entity_filter else ["Stores", "Ventures"]
+
     _entity_totals = {}
-    for _entity_name in ["Stores", "Ventures"]:
-        _entity_rows      = [r for r in _acct_balances if r["entity"] == _entity_name]
+    for _entity_name in entities_to_show:
+        _entity_rows = [r for r in _acct_balances if r["entity"] == _entity_name]
+        if abs_bank_filter and not _entity_rows:
+            continue  # this entity has no matching account when Bank filter applied
         _entity_bank_total = sum(r["balance"] for r in _entity_rows)
         _entity_totals[_entity_name] = _render_entity_subtotal(
-            _entity_name, _entity_bank_total, _entity_rows, inv_bals
+            _entity_name, _entity_bank_total, _entity_rows,
+            show_investments, as_of_date
         )
 
-    _grand_total = sum(_entity_totals.values()) + _cash_at_stores
+    _grand_total = sum(_entity_totals.values())
+    if (not abs_entity_filter or abs_entity_filter == "Stores") and not abs_bank_filter:
+        _grand_total += _cash_at_stores
+
     st.markdown(
         f'<div style="background:#1B2B4B;color:#fff;padding:8px 12px;'
         f'border-radius:6px;font-weight:800;font-size:14px;'

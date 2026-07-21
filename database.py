@@ -1499,6 +1499,52 @@ def get_account_balances(financial_year=None):
     return rows
 
 
+def get_account_balances_asof(as_of_date, entity_filter=None, bank_filter=None):
+    """
+    Per-account balance AS ON a specific date, filtered by entity and/or bank.
+    Returns list of dicts: bank_id, bank, purpose, entity, acc_no, balance.
+    """
+    conn = get_connection()
+    results = []
+
+    for bank_id, meta in ACCOUNT_META.items():
+        if entity_filter and entity_filter != "All" and meta["entity"] != entity_filter:
+            continue
+        if bank_filter and bank_filter != "All" and bank_id != bank_filter:
+            continue
+
+        row = conn.execute("""
+            SELECT balance FROM transactions
+            WHERE bank=?
+            AND date <= ?
+            AND final_group != 'OPENING BALANCE'
+            AND balance IS NOT NULL
+            ORDER BY date DESC, id DESC LIMIT 1
+        """, [bank_id, as_of_date]).fetchone()
+
+        if row and row["balance"] is not None:
+            balance = row["balance"]
+        else:
+            ob = conn.execute("""
+                SELECT balance FROM transactions
+                WHERE bank=? AND final_group='OPENING BALANCE'
+                ORDER BY date DESC LIMIT 1
+            """, [bank_id]).fetchone()
+            balance = ob["balance"] if (ob and ob["balance"] is not None) else 0.0
+
+        results.append({
+            "bank_id": bank_id,
+            "bank":    meta["bank"],
+            "purpose": meta["purpose"],
+            "entity":  meta["entity"],
+            "acc_no":  bank_id.split("-")[1] if "-" in bank_id else bank_id,
+            "balance": round(balance, 2),
+        })
+
+    conn.close()
+    return results
+
+
 def get_cash_at_stores():
     """Return current Cash at Stores value (0.0 if never set)."""
     conn = get_connection()

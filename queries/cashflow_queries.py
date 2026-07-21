@@ -103,7 +103,11 @@ def fetch_cf(entity, d_from, d_to, db_file, financial_year=None):
             """, [bank] + entity_params).fetchone()
             opening_balances[bank] = (ob_row["balance"] if ob_row else 0) or 0
 
-    # ── Receipts — ALL credit > 0 transactions, excl. Investment (shown separately) ─
+    # ── Receipts — ALL credit > 0 transactions, no exclusions here ─────────────
+    # (Investment is excluded downstream, once receipts_nested/payouts_nested
+    #  are final — see the Investment separation block after Interbank/
+    #  Intercompany netting. main_group never equals 'INVESTMENT' in this DB;
+    #  the investment marker lives in group_name ('INVESTMENT'/'Investment').)
     receipts = conn.execute(f"""
         SELECT
             COALESCE(NULLIF(TRIM(group_name), ''), 'Other') as group_name,
@@ -117,13 +121,12 @@ def fetch_cf(entity, d_from, d_to, db_file, financial_year=None):
         FROM transactions
         WHERE credit > 0
         AND final_group != 'OPENING BALANCE'
-        AND UPPER(COALESCE(main_group, '')) != 'INVESTMENT'
         AND date BETWEEN ? AND ? {entity_clause} {fy_clause}
         GROUP BY group_name, category
         ORDER BY group_name, total DESC
     """, [d_from, d_to] + entity_params + fy_param).fetchall()
 
-    # ── Payouts — ALL debit > 0 transactions, excl. Investment (shown separately) ──
+    # ── Payouts — ALL debit > 0 transactions, no exclusions here ───────────────
     payouts = conn.execute(f"""
         SELECT
             COALESCE(NULLIF(TRIM(group_name), ''), 'Other') as group_name,
@@ -137,24 +140,10 @@ def fetch_cf(entity, d_from, d_to, db_file, financial_year=None):
         FROM transactions
         WHERE debit > 0
         AND final_group != 'OPENING BALANCE'
-        AND UPPER(COALESCE(main_group, '')) != 'INVESTMENT'
         AND date BETWEEN ? AND ? {entity_clause} {fy_clause}
         GROUP BY group_name, category
         ORDER BY group_name, total DESC
     """, [d_from, d_to] + entity_params + fy_param).fetchall()
-
-    # ── Investment — separate reconciling line (still counted in Closing Balance) ──
-    _inv_row = conn.execute(f"""
-        SELECT
-            ROUND(SUM(CASE WHEN credit>0 THEN credit ELSE 0 END),2) as cr,
-            ROUND(SUM(CASE WHEN debit>0  THEN debit  ELSE 0 END),2) as dr
-        FROM transactions
-        WHERE UPPER(COALESCE(main_group, ''))='INVESTMENT'
-        AND date BETWEEN ? AND ? {entity_clause} {fy_clause}
-    """, [d_from, d_to] + entity_params + fy_param).fetchone()
-    investment_inflow  = _inv_row["cr"] or 0
-    investment_outflow = _inv_row["dr"] or 0
-    investment_net      = round(investment_inflow - investment_outflow, 2)
 
     # ── Closing balance — computed from formula per bank ──────────────────────
     # Opening + ALL credits - ALL debits (interbank + intercompany included)
@@ -264,6 +253,26 @@ def fetch_cf(entity, d_from, d_to, db_file, financial_year=None):
             else:
                 payouts_nested["Intercompany (Net)"]  = {"Intercompany (Net)": abs(ic_net)}
 
+    # --- Investment separation (must run AFTER receipts_nested/payouts_nested
+    # are final, i.e. after Interbank/Intercompany netting above) ---
+    # main_group is NEVER 'INVESTMENT' in this DB (confirmed: only '', 'Payment',
+    # 'Receipt', 'INTERBANK', 'INTERCOMPANY', 'OPENING BALANCE' occur there).
+    # The investment marker lives in group_name ('INVESTMENT' / 'Investment').
+    # conn is already closed at this point, so extract from the nested dicts
+    # already built from the DB rows rather than re-querying.
+    def _extract_investment(nested):
+        total = 0
+        for grp in list(nested.keys()):
+            if "investment" in grp.strip().lower():
+                total += sum(nested[grp].values())
+                del nested[grp]
+        return total
+
+    investment_inflow  = _extract_investment(receipts_nested)
+    investment_outflow = _extract_investment(payouts_nested)
+    investment_net      = round(investment_inflow - investment_outflow, 2)
+
+    # Recompute totals from the now-cleaned nested dicts
     _total_rec = sum(sum(v.values()) for v in receipts_nested.values())
     _total_pay = sum(sum(v.values()) for v in payouts_nested.values())
 
