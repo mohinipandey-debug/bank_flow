@@ -103,7 +103,7 @@ def fetch_cf(entity, d_from, d_to, db_file, financial_year=None):
             """, [bank] + entity_params).fetchone()
             opening_balances[bank] = (ob_row["balance"] if ob_row else 0) or 0
 
-    # ── Receipts — ALL credit > 0 transactions, no exclusions ─────────────────
+    # ── Receipts — ALL credit > 0 transactions, excl. Investment (shown separately) ─
     receipts = conn.execute(f"""
         SELECT
             COALESCE(NULLIF(TRIM(group_name), ''), 'Other') as group_name,
@@ -117,12 +117,13 @@ def fetch_cf(entity, d_from, d_to, db_file, financial_year=None):
         FROM transactions
         WHERE credit > 0
         AND final_group != 'OPENING BALANCE'
+        AND UPPER(COALESCE(main_group, '')) != 'INVESTMENT'
         AND date BETWEEN ? AND ? {entity_clause} {fy_clause}
         GROUP BY group_name, category
         ORDER BY group_name, total DESC
     """, [d_from, d_to] + entity_params + fy_param).fetchall()
 
-    # ── Payouts — ALL debit > 0 transactions, no exclusions ───────────────────
+    # ── Payouts — ALL debit > 0 transactions, excl. Investment (shown separately) ──
     payouts = conn.execute(f"""
         SELECT
             COALESCE(NULLIF(TRIM(group_name), ''), 'Other') as group_name,
@@ -136,10 +137,24 @@ def fetch_cf(entity, d_from, d_to, db_file, financial_year=None):
         FROM transactions
         WHERE debit > 0
         AND final_group != 'OPENING BALANCE'
+        AND UPPER(COALESCE(main_group, '')) != 'INVESTMENT'
         AND date BETWEEN ? AND ? {entity_clause} {fy_clause}
         GROUP BY group_name, category
         ORDER BY group_name, total DESC
     """, [d_from, d_to] + entity_params + fy_param).fetchall()
+
+    # ── Investment — separate reconciling line (still counted in Closing Balance) ──
+    _inv_row = conn.execute(f"""
+        SELECT
+            ROUND(SUM(CASE WHEN credit>0 THEN credit ELSE 0 END),2) as cr,
+            ROUND(SUM(CASE WHEN debit>0  THEN debit  ELSE 0 END),2) as dr
+        FROM transactions
+        WHERE UPPER(COALESCE(main_group, ''))='INVESTMENT'
+        AND date BETWEEN ? AND ? {entity_clause} {fy_clause}
+    """, [d_from, d_to] + entity_params + fy_param).fetchone()
+    investment_inflow  = _inv_row["cr"] or 0
+    investment_outflow = _inv_row["dr"] or 0
+    investment_net      = round(investment_inflow - investment_outflow, 2)
 
     # ── Closing balance — computed from formula per bank ──────────────────────
     # Opening + ALL credits - ALL debits (interbank + intercompany included)
@@ -266,9 +281,15 @@ def fetch_cf(entity, d_from, d_to, db_file, financial_year=None):
         "total_payouts":           _total_pay,   # post-netting (matches breakdown display)
         "total_closing":           total_closing,
         "net_cash_flow":           total_closing - sum(opening_balances.values()),
+        # Net Cash Position = pure operating movement, excludes Investment
+        "net_cash_position":       _total_rec - _total_pay,
         # Reconciling: non-zero signals a missing statement or mis-tagged transaction
         "interbank_net":           interbank_period_net    if abs(interbank_period_net)    > 1 else None,
         "intercompany_net":        intercompany_period_net if abs(intercompany_period_net) > 1 else None,
         "interbank_period_net":    interbank_period_net,
         "intercompany_period_net": intercompany_period_net,
+        # Investment — separate reconciling line (Closing Balance still includes it)
+        "investment_net":          investment_net,
+        "investment_inflow":       investment_inflow,
+        "investment_outflow":      investment_outflow,
     }

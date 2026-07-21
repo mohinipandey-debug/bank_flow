@@ -1564,7 +1564,7 @@ section[data-testid="stSidebar"] [data-testid="stImage"] img {
 init_db()
 
 # ── Navigation session state ──────────────────────────────────────────────────
-_NAV_TABS = ["Summary", "Cash Flow", "Transactions", "Uncategorised", "Exception Report", "Investments", "Upload"]
+_NAV_TABS = ["Summary", "Cash Flow", "Investments", "Transactions", "Uncategorised", "Exception Report", "Upload"]
 
 _today          = datetime.date.today()
 _first_of_month = _today.replace(day=1)
@@ -1867,44 +1867,55 @@ st.markdown(f"""
             <span class="pill pill-period">📅 {period_label}</span>
         </div>
     </div>
-    <div style="margin-top:16px;">
-        <div style="background:#1B2B4B; border-radius:12px; padding:24px 28px;">
-            <div style="font-size:11px; font-weight:700; color:#8896A5;
+    <div style="background:#1B2B4B; border-radius:12px;
+         padding:18px 28px; margin-top:16px;
+         display:flex; align-items:center; justify-content:space-between;
+         gap:32px;">
+        <div style="flex-shrink:0;">
+            <div style="font-size:10px; font-weight:700; color:#8896A5;
                  letter-spacing:0.1em; text-transform:uppercase;
-                 margin-bottom:4px;">TOTAL CASH POSITION · AS ON {as_of_display}</div>
-            <div style="font-size:36px; font-weight:800; color:#FFFFFF;
-                 letter-spacing:-1px; margin-bottom:20px;">
+                 margin-bottom:4px;">TOTAL CASH POSITION</div>
+            <div style="font-size:32px; font-weight:800; color:#FFFFFF;
+                 letter-spacing:-1px; line-height:1;">
                 {fmt_cr(total_cash_position)}
             </div>
+            <div style="font-size:11px; color:#8896A5; margin-top:4px;">
+                As on {as_of_display}
+            </div>
+        </div>
+        <div style="flex-grow:1; max-width:480px;">
             <table style="width:100%; border-collapse:collapse;">
                 <tr style="border-bottom:1px solid rgba(255,255,255,0.15);">
-                    <td style="padding:8px 0; color:#8896A5; font-size:12px;
-                        font-weight:700; text-transform:uppercase;">Entity</td>
-                    <td style="padding:8px 0; color:#8896A5; font-size:12px;
-                        font-weight:700; text-transform:uppercase;
-                        text-align:right;">Bank Balance</td>
-                    <td style="padding:8px 0; color:#8896A5; font-size:12px;
-                        font-weight:700; text-transform:uppercase;
-                        text-align:right;">Investments</td>
+                    <td style="padding:4px 12px 6px 0; color:#8896A5;
+                        font-size:11px; font-weight:700;
+                        text-transform:uppercase;">Entity</td>
+                    <td style="padding:4px 12px 6px 0; color:#8896A5;
+                        font-size:11px; font-weight:700;
+                        text-transform:uppercase; text-align:right;">
+                        Bank Balance</td>
+                    <td style="padding:4px 0 6px 0; color:#8896A5;
+                        font-size:11px; font-weight:700;
+                        text-transform:uppercase; text-align:right;">
+                        Investments</td>
                 </tr>
                 <tr>
-                    <td style="padding:10px 0; color:#FFFFFF; font-size:15px;
-                        font-weight:600;">Stores</td>
-                    <td style="padding:10px 0; color:#FFFFFF; font-size:15px;
-                        font-weight:700; text-align:right;">
+                    <td style="padding:6px 12px 6px 0; color:#FFFFFF;
+                        font-size:14px; font-weight:600;">Stores</td>
+                    <td style="padding:6px 12px 6px 0; color:#FFFFFF;
+                        font-size:14px; font-weight:700; text-align:right;">
                         {fmt_cr(stores_bank_asof)}</td>
-                    <td style="padding:10px 0; color:#93C5FD; font-size:15px;
-                        font-weight:700; text-align:right;">
+                    <td style="padding:6px 0; color:#93C5FD;
+                        font-size:14px; font-weight:700; text-align:right;">
                         {fmt_cr(stores_inv_asof)}</td>
                 </tr>
                 <tr>
-                    <td style="padding:10px 0; color:#FFFFFF; font-size:15px;
-                        font-weight:600;">Ventures</td>
-                    <td style="padding:10px 0; color:#FFFFFF; font-size:15px;
-                        font-weight:700; text-align:right;">
+                    <td style="padding:6px 12px 0 0; color:#FFFFFF;
+                        font-size:14px; font-weight:600;">Ventures</td>
+                    <td style="padding:6px 12px 0 0; color:#FFFFFF;
+                        font-size:14px; font-weight:700; text-align:right;">
                         {fmt_cr(ventures_bank_asof)}</td>
-                    <td style="padding:10px 0; color:#93C5FD; font-size:15px;
-                        font-weight:700; text-align:right;">
+                    <td style="padding:6px 0 0 0; color:#93C5FD;
+                        font-size:14px; font-weight:700; text-align:right;">
                         {fmt_cr(ventures_inv_asof)}</td>
                 </tr>
             </table>
@@ -3004,6 +3015,12 @@ elif selected_tab == "Cash Flow":
     else:
         week_anchor = datetime.date.today()
 
+    # ── View toggle: Monthly vs Weekly ────────────────────────────────────────
+    cf_view = st.radio(
+        "View", ["Monthly", "Weekly"],
+        horizontal=True, key="cf_view_toggle", label_visibility="collapsed"
+    )
+
     # ── Expand / Collapse All ─────────────────────────────────────────────────
     # Match section toggles (_open suffix) and group toggles (_grp_ in key)
     # but NOT widget keys like cf_ent_radio / cf_from / cf_to.
@@ -3081,7 +3098,7 @@ elif selected_tab == "Cash Flow":
     # ─────────────────────────────────────────────────────────────────────────
     # MONTHLY VIEW
     # ─────────────────────────────────────────────────────────────────────────
-    if True:  # Monthly — always shown
+    if cf_view == "Monthly":
         st.markdown(f"""
 <div style="background:#1B2B4B; color:#FFFFFF; border-radius:8px;
      padding:10px 20px; margin:16px 0 8px 0; font-size:13px;
@@ -3202,19 +3219,23 @@ elif selected_tab == "Cash Flow":
                                         unsafe_allow_html=True)
         st.markdown('<hr class="cf-divider-sm">', unsafe_allow_html=True)
 
-        # ── Reconciling lines: Interbank / Intercompany net ───────────────────
-        for _recon_lbl, _recon_key in [
-            ("Interbank (Net)",    "interbank_period_net"),
-            ("Intercompany (Net)", "intercompany_period_net"),
+        # ── Reconciling lines: Interbank / Intercompany / Investment net ──────
+        for _recon_lbl, _recon_key, _recon_color in [
+            ("Interbank (Net)",    "interbank_period_net", None),
+            ("Intercompany (Net)", "intercompany_period_net", None),
+            ("Investments (Net)",  "investment_net", "#7C3AED"),
         ]:
             _rval = cf.get(_recon_key) or 0
-            if abs(_rval) > 1:
-                _rcol = "#16A34A" if _rval >= 0 else "#DC2626"
+            _rout = cf.get("investment_outflow") if _recon_key == "investment_net" else None
+            _rin  = cf.get("investment_inflow")  if _recon_key == "investment_net" else None
+            if abs(_rval) > 1 or _rout or _rin:
+                _rcol = _recon_color or ("#16A34A" if _rval >= 0 else "#DC2626")
+                _bg   = "#F5F3FF" if _recon_key == "investment_net" else "#F8FAFF"
                 _rh1, _rh2, _rh3 = st.columns([0.04, 0.71, 0.25])
                 with _rh2:
                     st.markdown(
                         f'<div style="padding:6px 12px; font-size:13px; font-weight:600; '
-                        f'color:{_rcol}; background:#F8FAFF; border-radius:4px;">'
+                        f'color:{_rcol}; background:{_bg}; border-radius:4px;">'
                         f'{_recon_lbl}</div>',
                         unsafe_allow_html=True)
                 with _rh3:
@@ -3230,12 +3251,12 @@ elif selected_tab == "Cash Flow":
             "cf_cb_open", "btn_cf_cb", section_cls="cf-cb", section_bg="#DBEAFE"
         )
 
-        # NET CASH FLOW — always visible
-        _net     = cf["net_cash_flow"]
+        # NET CASH POSITION — Receipts minus Payouts, excludes Investment
+        _net     = cf["net_cash_position"]
         _net_cls = "pos" if _net >= 0 else "neg"
         st.markdown(f"""
 <div class="cf-net {_net_cls}">
-  <span>NET CASH FLOW</span>
+  <span>NET CASH POSITION</span>
   <span>{_inr(_net)}</span>
 </div>""", unsafe_allow_html=True)
 
@@ -3316,11 +3337,13 @@ elif selected_tab == "Cash Flow":
                 for k, v in payouts_ordered.items():
                     _xlr(k, v, indent=1)
                 _xlr("Total Payouts", cf["total_payouts"], style="total")
+                if cf.get("investment_net") or cf.get("investment_inflow") or cf.get("investment_outflow"):
+                    _xlr("Investments (Net)", cf["investment_net"], style="header")
                 _xlr("Closing Balance", style="header")
                 for k, v in cf["closing_balances"].items():
                     _xlr(f"Bank ({k})", v, indent=1)
                 _xlr("Total Closing Balance", cf["total_closing"], style="total")
-                _xlr("Net Cash Flow", cf["net_cash_flow"], style="net")
+                _xlr("Net Cash Position", cf["net_cash_position"], style="net")
                 out = io.BytesIO()
                 wb.save(out)
                 return out.getvalue()
@@ -3337,7 +3360,7 @@ elif selected_tab == "Cash Flow":
     # ─────────────────────────────────────────────────────────────────────────
     # WEEKLY VIEW
     # ─────────────────────────────────────────────────────────────────────────
-    if True:  # Weekly — always shown
+    else:  # Weekly
         st.markdown(f"""
 <div style="background:#1B2B4B; color:#FFFFFF; border-radius:8px;
      padding:10px 20px; margin:24px 0 8px 0; font-size:13px;
@@ -3692,21 +3715,24 @@ elif selected_tab == "Cash Flow":
             '<hr class="cf-divider-sm">',
             unsafe_allow_html=True)
 
-        # ── Reconciling lines: Interbank / Intercompany net per week ─────
+        # ── Reconciling lines: Interbank / Intercompany / Investment net per week ─
         _WK_RECON_BG = ["#F0F7FF", "#FFFFFF", "#F0F7FF", "#FFFFFF"]
-        for _recon_lbl, _recon_key in [
-            ("Interbank (Net)",    "interbank_period_net"),
-            ("Intercompany (Net)", "intercompany_period_net"),
+        for _recon_lbl, _recon_key, _recon_color in [
+            ("Interbank (Net)",    "interbank_period_net", None),
+            ("Intercompany (Net)", "intercompany_period_net", None),
+            ("Investments (Net)",  "investment_net", "#7C3AED"),
         ]:
             _week_vals   = [_wd.get(_recon_key) or 0 for _wd in _w_data]
+            _week_has_inv = any(_wd.get("investment_inflow") or _wd.get("investment_outflow") for _wd in _w_data)
             _grand_total = sum(_week_vals)
-            if any(abs(_v) > 1 for _v in _week_vals):
+            if any(abs(_v) > 1 for _v in _week_vals) or (_recon_key == "investment_net" and _week_has_inv):
                 _rr = st.columns(CF_COLS)
                 with _rr[1]:
-                    _rc = "#16A34A" if _grand_total >= 0 else "#DC2626"
+                    _rc = _recon_color or ("#16A34A" if _grand_total >= 0 else "#DC2626")
+                    _rbg = "#F5F3FF" if _recon_key == "investment_net" else "#F8FAFF"
                     st.markdown(
                         f'<div style="padding:6px 12px; font-size:13px; font-weight:600; '
-                        f'color:{_rc}; background:#F8FAFF; border-radius:4px;">'
+                        f'color:{_rc}; background:{_rbg}; border-radius:4px;">'
                         f'{_recon_lbl}</div>',
                         unsafe_allow_html=True)
                 for _i, _v in enumerate(_week_vals):
@@ -3771,11 +3797,11 @@ elif selected_tab == "Cash Flow":
             '<hr class="cf-divider-sm">',
             unsafe_allow_html=True)
 
-        # ── Net Cash Flow per week — always visible ───────────────────────
+        # ── Net Cash Position per week — always visible ───────────────────
         _wnet_r = st.columns(CF_COLS)
         with _wnet_r[1]:
             st.markdown(
-                '<div class="cf-wk-net-label">NET CASH FLOW</div>',
+                '<div class="cf-wk-net-label">NET CASH POSITION</div>',
                 unsafe_allow_html=True)
         _total_wnet = sum(
             _w_data[_wi]["total_receipts"] - _w_data[_wi]["total_payouts"]
@@ -3833,29 +3859,31 @@ elif selected_tab == "Investments":
 
     st.markdown("## Investment Portfolio")
 
-    # ── Filters ──────────────────────────────────────────────────────────────
-    f1, f2, f3, f4 = st.columns([2, 2, 2, 2])
+    # ── Filters — Entity only; dates come from sidebar Date Range ────────────
+    f1, f2 = st.columns([2, 2])
     with f1:
         inv_entity = st.radio(
             "Entity", ["All", "Stores", "Ventures"],
             horizontal=True, key="inv_entity")
     with f2:
-        inv_from = st.date_input(
-            "From", value=_first_of_month, key="inv_from")
-    with f3:
-        inv_to = st.date_input(
-            "To", value=_today, key="inv_to")
-    with f4:
         st.markdown("<br>", unsafe_allow_html=True)
         if st.button("🔄 Refresh", key="inv_refresh"):
             st.rerun()
+
+    # Use sidebar date range if set, else default to full history
+    if use_date_range and sel_date_from and sel_date_to:
+        inv_date_from = str(sel_date_from)
+        inv_date_to   = str(sel_date_to)
+    else:
+        inv_date_from = None
+        inv_date_to   = None
 
     # ── Get data ──────────────────────────────────────────────────────────────
     entity_filter = inv_entity if inv_entity != "All" else None
     inv_data = get_investment_summary(
         entity=entity_filter,
-        date_from=str(inv_from),
-        date_to=str(inv_to),
+        date_from=inv_date_from,
+        date_to=inv_date_to,
     )
 
     fds = [r for r in inv_data if r["scheme_type"] == "FD"]
@@ -3915,36 +3943,6 @@ elif selected_tab == "Investments":
                         except AttributeError:
                             st.experimental_rerun()
 
-    # ── Summary KPI strip ─────────────────────────────────────────────────────
-    _inv_kpis   = get_investment_kpis(
-        entity=inv_entity if inv_entity != "All" else None
-    )
-    _ik_opening = _inv_kpis["opening"]
-    _ik_mf      = _inv_kpis["mf_balance"]
-    _ik_fd      = _inv_kpis["fd_balance"]
-    _ik_closing = _inv_kpis["closing"]
-    _ik_cls     = "#16A34A" if _ik_closing >= _ik_opening else "#DC2626"
-
-    k1, k2, k3, k4 = st.columns(4)
-    for _col, _label, _value, _color in [
-        (k1, "OPENING BALANCE", _ik_opening, "#1B2B4B"),
-        (k2, "MUTUAL FUND",     _ik_mf,      "#5B21B6"),
-        (k3, "FIXED DEPOSIT",   _ik_fd,      "#1E40AF"),
-        (k4, "CLOSING BALANCE", _ik_closing, _ik_cls),
-    ]:
-        with _col:
-            st.markdown(f"""
-<div style="background:#FFFFFF;border-radius:10px;padding:16px 20px;
-     border:1px solid #E8ECF0;border-top:3px solid {_color};
-     box-shadow:0 1px 3px rgba(0,0,0,0.04);">
-  <div style="font-size:10px;font-weight:700;color:#8896A5;letter-spacing:0.1em;
-       text-transform:uppercase;margin-bottom:6px;">{_label}</div>
-  <div style="font-size:20px;font-weight:700;color:{_color};">{fmt_cr(_value)}</div>
-</div>
-""", unsafe_allow_html=True)
-
-    st.markdown("<br>", unsafe_allow_html=True)
-
     # ── Cash at Stores ────────────────────────────────────────────────────────
     st.markdown('<div class="section-header" style="margin-bottom:10px;">Cash at Stores</div>',
                 unsafe_allow_html=True)
@@ -3978,8 +3976,8 @@ elif selected_tab == "Investments":
 
     inv_movements  = get_investment_movements(
         entity=entity_filter,
-        date_from=str(inv_from),
-        date_to=str(inv_to),
+        date_from=inv_date_from,
+        date_to=inv_date_to,
     )
     inv_register   = get_investment_register()
     manual_totals  = get_manual_investment_totals()
@@ -4269,8 +4267,8 @@ elif selected_tab == "Investments":
         "Add scheme name and number for portfolio tracking.")
 
     _inv_txns = get_investment_transactions(
-        date_from=str(inv_from),
-        date_to=str(inv_to),
+        date_from=inv_date_from,
+        date_to=inv_date_to,
         entity=entity_filter,
     )
 

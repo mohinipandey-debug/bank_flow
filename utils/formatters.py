@@ -27,7 +27,7 @@ def _inr(val):
             parts.insert(0, rem[-2:])
             rem = rem[:-2]
         r = ",".join(p for p in parts if p) + "," + last3
-    return ("(₹" if neg else "₹") + r
+    return f"(₹{r})" if neg else f"₹{r}"
 
 
 def _td(val, red=False, net=False):
