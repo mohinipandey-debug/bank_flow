@@ -16,7 +16,8 @@ from database import (
     get_transaction_count, get_closing_balance, get_paginated_transactions,
     get_transfer_reconciliation, get_monthly_trend,
     get_yoy_comparison, get_top_expenses_comparison, get_weekly_cash_position,
-    log_upload, get_upload_trail, delete_upload,
+    get_upload_trail, delete_upload,
+    reserve_upload_trail, finalize_upload_trail, check_upload_delete_impact,
     get_account_balances,
     set_cash_entry, get_cash_asof, get_cash_history,
     delete_cash_entry, import_cash_excel,
@@ -2882,13 +2883,46 @@ elif selected_tab == "Exception Report":
                     st.session_state[f"confirm_del_{_t['id']}"] = True
                     st.rerun()
             if st.session_state.get(f"confirm_del_{_t['id']}"):
-                st.warning(f"Delete **{_t['filename']}** ({_t['rows_inserted']:,} rows)? "
-                           f"This cannot be undone.")
+                _impact = check_upload_delete_impact(_t["id"])
+                _mo_count = _impact["manually_overridden_count"]
+                _match_mode = _impact["match_mode"]
+
+                st.warning(
+                    f"Delete **{_t['filename']}**? This will remove "
+                    f"{_impact['total_matched']:,} transaction row(s) "
+                    f"it created. This cannot be undone."
+                )
+                if _match_mode == "legacy_heuristic":
+                    st.info(
+                        "This upload predates exact tracking — matching rows "
+                        "were identified by filename + entity + bank + date "
+                        "range rather than an exact link. Double-check the "
+                        "count above looks right before confirming."
+                    )
+
+                _force_override = False
+                if _mo_count > 0:
+                    st.error(
+                        f"⚠️ {_mo_count:,} of these rows were manually "
+                        f"corrected (manually_overridden=1) and will be "
+                        f"SKIPPED by default. Check the box below to also "
+                        f"delete those manually-corrected rows."
+                    )
+                    _force_override = st.checkbox(
+                        f"Also delete the {_mo_count:,} manually-corrected row(s)",
+                        key=f"force_mo_{_t['id']}"
+                    )
+
                 _dc1, _dc2 = st.columns([1, 4])
                 with _dc1:
                     if st.button("Confirm Delete", key=f"confirm_yes_{_t['id']}"):
-                        _deleted = delete_upload(_t["id"])
-                        st.success(f"Deleted {_deleted:,} rows from {_t['filename']}")
+                        _result = delete_upload(
+                            _t["id"], include_manually_overridden=_force_override)
+                        _msg = f"Deleted {_result['deleted']:,} rows from {_t['filename']}"
+                        if _result["manually_overridden_skipped"]:
+                            _msg += (f" ({_result['manually_overridden_skipped']:,} "
+                                     f"manually-corrected rows kept)")
+                        st.success(_msg)
                         del st.session_state[f"confirm_del_{_t['id']}"]
                         st.cache_data.clear()
                         st.rerun()
@@ -4578,6 +4612,12 @@ elif selected_tab == "Upload":
 
         _suffix  = _os_up.path.splitext(_uploaded_file.name)[1].lower() or ".xlsx"
         _tmp_path = None
+        # Reserve the trail row FIRST so its id can be stamped on every
+        # inserted transaction row (upload_id) — this is the reliable link
+        # delete_upload() uses later; filename/entity/bank/date alone can't
+        # be trusted since the same statement filename gets re-uploaded
+        # every period.
+        _trail_id = reserve_upload_trail(_uploaded_file.name, _up_entity, _up_account)
         try:
             with _tempfile.NamedTemporaryFile(
                     delete=False, suffix=_suffix, dir=_script_dir) as _tmp:
@@ -4592,26 +4632,25 @@ elif selected_tab == "Upload":
                     entity=_up_entity,
                     bank=_up_account,
                     delete_after=True,
+                    upload_id=_trail_id,
                 )
 
             if _ins > 0:
-                # Derive date range and FY from inserted rows
+                # Derive date range and FY from the rows this upload just inserted,
+                # matched by upload_id — exact, unlike filename which can repeat.
                 import sqlite3 as _sq3
                 _conn2 = _sq3.connect(DATABASE_FILE)
                 _dr = _conn2.execute("""
                     SELECT MIN(date), MAX(date), financial_year
                     FROM transactions
-                    WHERE source_file=? AND entity=? AND bank=?
-                    ORDER BY loaded_at DESC LIMIT 1
-                """, [_uploaded_file.name, _up_entity, _up_account]).fetchone()
+                    WHERE upload_id=?
+                """, [_trail_id]).fetchone()
                 _conn2.close()
                 _d_from = _dr[0] if _dr else ""
                 _d_to   = _dr[1] if _dr else ""
                 _fy     = _dr[2] if _dr else ""
-                log_upload(
-                    filename=_uploaded_file.name,
-                    entity=_up_entity,
-                    bank=_up_account,
+                finalize_upload_trail(
+                    _trail_id,
                     financial_year=_fy,
                     rows_inserted=_ins,
                     date_from=_d_from,
@@ -4622,20 +4661,24 @@ elif selected_tab == "Upload":
                     "inserted": _ins, "skipped": _skp,
                     "entity": _up_entity, "bank": _up_account,
                 }
-            elif _skp > 0:
-                st.session_state["last_process_result"] = {
-                    "status": "already_loaded", "filename": _uploaded_file.name,
-                    "skipped": _skp,
-                }
             else:
-                st.session_state["last_process_result"] = {
-                    "status": "error", "filename": _uploaded_file.name,
-                    "message": "No rows processed. Check file format.",
-                }
+                # Nothing inserted — discard the reserved placeholder trail row.
+                delete_upload(_trail_id)
+                if _skp > 0:
+                    st.session_state["last_process_result"] = {
+                        "status": "already_loaded", "filename": _uploaded_file.name,
+                        "skipped": _skp,
+                    }
+                else:
+                    st.session_state["last_process_result"] = {
+                        "status": "error", "filename": _uploaded_file.name,
+                        "message": "No rows processed. Check file format.",
+                    }
         except Exception as _e:
             if _tmp_path and _os_up.path.exists(_tmp_path):
                 try: _os_up.unlink(_tmp_path)
                 except OSError: pass
+            delete_upload(_trail_id)  # discard the reserved placeholder trail row
             st.session_state["last_process_result"] = {
                 "status": "error", "filename": _uploaded_file.name,
                 "message": str(_e),

@@ -11,8 +11,12 @@ STATEMENTS_DIR = "statements"
 PROCESSED_DIR  = "processed"
 
 
-def process_file(filepath, keywords=None, entity=None, bank=None, delete_after=False):
-    """Full pipeline: read -> categorize -> save -> archive (or delete if delete_after=True)."""
+def process_file(filepath, keywords=None, entity=None, bank=None, delete_after=False,
+                  upload_id=None):
+    """Full pipeline: read -> categorize -> save -> archive (or delete if delete_after=True).
+    upload_id, when given, is stamped onto every inserted row so a later
+    delete_upload() call can identify exactly these rows, not just ones that
+    happen to share the same filename/entity/bank/date range."""
     print(f"\n{'='*55}")
     print(f"[PROCESS] {filepath}")
 
@@ -39,6 +43,8 @@ def process_file(filepath, keywords=None, entity=None, bank=None, delete_after=F
               f"and click 'Reload Keywords' in the dashboard.\n")
     # ────────────────────────────────────────────────────────────────────────
 
+    if upload_id is not None:
+        df["upload_id"] = upload_id
     records = df.to_dict("records")
     inserted, skipped = insert_transactions(records)
     print(f"[DB] Inserted: {inserted} | Skipped duplicates: {skipped}")

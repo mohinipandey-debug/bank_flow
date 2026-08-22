@@ -73,6 +73,24 @@ def init_db():
     except Exception:
         pass  # Already exists
 
+    # Migration: add upload_id column — links each transaction row back to the
+    # exact upload_trail entry that inserted it, so a delete can identify the
+    # right rows without guessing from filename/entity/bank/date (which collide
+    # whenever the same statement filename is re-uploaded for a later period).
+    try:
+        conn.execute("ALTER TABLE transactions ADD COLUMN upload_id INTEGER")
+        conn.commit()
+    except Exception:
+        pass  # Already exists
+
+    try:
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_txn_upload_id ON transactions(upload_id)"
+        )
+        conn.commit()
+    except Exception:
+        pass
+
     # Backfill financial_year for any rows that don't have it yet
     conn.execute("""
         UPDATE transactions
@@ -321,8 +339,8 @@ def insert_transactions(rows):
                 (fingerprint, entity, bank, date, narration,
                  debit, credit, balance, category, final_group,
                  group_name, main_group, source_file, manually_overridden,
-                 financial_year)
-                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                 financial_year, upload_id)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             """, (
                 fp,
                 row["entity"], row["bank"], row["date"], row["narration"],
@@ -333,7 +351,8 @@ def insert_transactions(rows):
                 row.get("main_group")  or "",
                 row.get("source_file"),
                 int(row.get("manually_overridden", 0)),
-                fy
+                fy,
+                row.get("upload_id"),
             ))
             inserted += 1
         except Exception:
@@ -376,6 +395,37 @@ def log_upload(filename, entity, bank, financial_year,
     return trail_id
 
 
+def reserve_upload_trail(filename, entity, bank):
+    """
+    Insert a placeholder upload_trail row BEFORE processing, so the returned
+    trail_id can be stamped onto each transaction row as upload_id. This is
+    what makes delete_upload() able to identify the exact rows a given
+    upload created, even if the same filename is re-uploaded later.
+    """
+    conn = get_connection()
+    conn.execute("""
+        INSERT INTO upload_trail
+        (filename, entity, bank, financial_year, rows_inserted, date_from, date_to)
+        VALUES (?, ?, ?, NULL, 0, NULL, NULL)
+    """, [filename, entity, bank])
+    conn.commit()
+    trail_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+    conn.close()
+    return trail_id
+
+
+def finalize_upload_trail(trail_id, financial_year, rows_inserted, date_from, date_to):
+    """Fill in the stats for a trail row created by reserve_upload_trail()."""
+    conn = get_connection()
+    conn.execute("""
+        UPDATE upload_trail
+        SET financial_year=?, rows_inserted=?, date_from=?, date_to=?
+        WHERE id=?
+    """, [financial_year, rows_inserted, date_from, date_to, trail_id])
+    conn.commit()
+    conn.close()
+
+
 def get_upload_trail():
     conn = get_connection()
     rows = conn.execute("""
@@ -390,37 +440,103 @@ def get_upload_trail():
     return [dict(r) for r in rows]
 
 
-def delete_upload(trail_id):
+def _upload_match_clause(conn, trail):
     """
-    Deletes all transactions from a specific upload.
-    Matches by source_file, entity, bank, and date range.
-    Marks trail record as deleted.
-    Returns count of deleted rows.
+    Decide how to identify the transaction rows belonging to this upload.
+    Preferred: exact upload_id link (stamped at insert time by reserve_upload_trail).
+    Fallback: legacy heuristic (source_file+entity+bank+date range) for uploads
+    that predate upload_id tracking — flagged as such since filename reuse
+    (e.g. the same monthly statement name re-uploaded later) can make this
+    heuristic ambiguous.
+    Returns (where_sql, params, match_mode).
+    """
+    has_upload_id = conn.execute(
+        "SELECT COUNT(*) FROM transactions WHERE upload_id=?",
+        [trail["id"]]
+    ).fetchone()[0]
+    if has_upload_id:
+        return "upload_id = ?", [trail["id"]], "upload_id"
+    return (
+        "source_file = ? AND entity = ? AND bank = ? AND date BETWEEN ? AND ?",
+        [trail["filename"], trail["entity"], trail["bank"],
+         trail["date_from"], trail["date_to"]],
+        "legacy_heuristic",
+    )
+
+
+def check_upload_delete_impact(trail_id):
+    """
+    Inspect (without deleting) what a delete_upload(trail_id) call would affect.
+    Returns dict: trail, match_mode, total_matched, manually_overridden_count.
     """
     conn = get_connection()
     trail = conn.execute(
-        "SELECT * FROM upload_trail WHERE id=?",
-        [trail_id]).fetchone()
+        "SELECT * FROM upload_trail WHERE id=?", [trail_id]).fetchone()
     if not trail:
         conn.close()
-        return 0
+        return {"trail": None, "match_mode": "none",
+                "total_matched": 0, "manually_overridden_count": 0}
     trail = dict(trail)
-    result = conn.execute("""
-        DELETE FROM transactions
-        WHERE source_file = ?
-        AND entity = ?
-        AND bank = ?
-        AND date BETWEEN ? AND ?
-        AND COALESCE(manually_overridden, 0) = 0
-    """, [trail["filename"], trail["entity"], trail["bank"],
-          trail["date_from"], trail["date_to"]])
+    where, params, match_mode = _upload_match_clause(conn, trail)
+
+    total = conn.execute(
+        f"SELECT COUNT(*) FROM transactions WHERE {where}", params
+    ).fetchone()[0]
+    overridden = conn.execute(
+        f"SELECT COUNT(*) FROM transactions WHERE {where} "
+        f"AND COALESCE(manually_overridden,0)=1", params
+    ).fetchone()[0]
+    conn.close()
+    return {
+        "trail": trail,
+        "match_mode": match_mode,
+        "total_matched": total,
+        "manually_overridden_count": overridden,
+    }
+
+
+def delete_upload(trail_id, include_manually_overridden=False):
+    """
+    Deletes the upload_trail row AND every transaction row that came from it.
+    Matches by the exact upload_id link when available; only falls back to the
+    source_file+entity+bank+date heuristic for uploads that predate upload_id
+    tracking (see _upload_match_clause).
+    manually_overridden rows are excluded unless include_manually_overridden=True
+    is explicitly passed — call check_upload_delete_impact() first to find out
+    if any exist so the caller can ask for confirmation.
+    Returns dict: deleted, manually_overridden_skipped, match_mode.
+    """
+    conn = get_connection()
+    trail = conn.execute(
+        "SELECT * FROM upload_trail WHERE id=?", [trail_id]).fetchone()
+    if not trail:
+        conn.close()
+        return {"deleted": 0, "manually_overridden_skipped": 0, "match_mode": "none"}
+    trail = dict(trail)
+    where, params, match_mode = _upload_match_clause(conn, trail)
+
+    overridden_skipped = 0
+    if not include_manually_overridden:
+        overridden_skipped = conn.execute(
+            f"SELECT COUNT(*) FROM transactions WHERE {where} "
+            f"AND COALESCE(manually_overridden,0)=1", params
+        ).fetchone()[0]
+        result = conn.execute(
+            f"DELETE FROM transactions WHERE {where} "
+            f"AND COALESCE(manually_overridden,0)=0", params
+        )
+    else:
+        result = conn.execute(f"DELETE FROM transactions WHERE {where}", params)
+
     deleted_rows = result.rowcount
-    conn.execute(
-        "UPDATE upload_trail SET deleted=1 WHERE id=?",
-        [trail_id])
+    conn.execute("UPDATE upload_trail SET deleted=1 WHERE id=?", [trail_id])
     conn.commit()
     conn.close()
-    return deleted_rows
+    return {
+        "deleted": deleted_rows,
+        "manually_overridden_skipped": overridden_skipped,
+        "match_mode": match_mode,
+    }
 
 
 def get_all_transactions(entity=None, bank=None, month=None, category=None,
