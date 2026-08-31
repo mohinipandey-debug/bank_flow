@@ -2021,14 +2021,28 @@ def import_investment_excel(filepath):
                     f"Stores or Ventures, got '{entity}'")
                 continue
 
+            _notes = f"Scheme No: {scheme_no}"
+            _dupe = conn.execute("""
+                SELECT COUNT(*) FROM manual_investments
+                WHERE entry_date=? AND scheme_name=? AND scheme_type=?
+                  AND amount=? AND entry_type=? AND entity=? AND notes=?
+            """, [entry_date, scheme_name, stype_clean,
+                  amount, et_clean, entity_clean, _notes]).fetchone()[0]
+            if _dupe:
+                skipped += 1
+                error_rows.append(
+                    f"Row {idx+2}: Duplicate of an existing entry "
+                    f"({scheme_name}, {entry_date}, {et_clean} "
+                    f"{amount:,.0f}) — skipped")
+                continue
+
             conn.execute("""
                 INSERT INTO manual_investments
                 (entry_date, scheme_name, scheme_type, amount,
                  entry_type, entity, notes)
                 VALUES (?,?,?,?,?,?,?)
             """, [entry_date, scheme_name, stype_clean,
-                  amount, et_clean, entity_clean,
-                  f"Scheme No: {scheme_no}"])
+                  amount, et_clean, entity_clean, _notes])
             inserted += 1
 
         except Exception as e:
