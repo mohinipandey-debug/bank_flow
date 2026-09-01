@@ -4698,13 +4698,23 @@ elif selected_tab == "Upload":
     ⚠️ Upload a <b>bankflow.db</b> file to restore all historical data.
     This will <b>replace</b> the current database entirely.
 </div>
+<div style="background:#EBF4FF; border-left:4px solid #3B82F6;
+     border-radius:6px; padding:10px 16px; margin-bottom:16px;
+     font-size:13px; color:#1E40AF;">
+    💡 <b>Large database?</b> Upload a <b>.gz</b> or <b>.zip</b> of your
+    bankflow.db instead of the raw file — it's compressed to roughly
+    a quarter of the size, which is far more reliable on a hosted upload
+    connection. On Windows: right-click <code>bankflow.db</code> →
+    <b>Send to → Compressed (zipped) folder</b>, then upload the
+    resulting .zip here. Plain uncompressed .db uploads are still supported.
+</div>
 """, unsafe_allow_html=True)
 
     _db_file = st.file_uploader(
-        "Select bankflow.db",
-        type=["db"],
+        "Select bankflow.db (.db, .gz, or .zip)",
+        type=["db", "gz", "zip"],
         key="db_restore_file",
-        help="Upload your existing bankflow.db to restore all data."
+        help="Upload your bankflow.db, or a .gz/.zip of it, to restore all data."
     )
 
     _db_confirm = st.checkbox("I understand this will replace the current database", key="db_restore_confirm")
@@ -4714,16 +4724,38 @@ elif selected_tab == "Upload":
 
     if _db_btn and _db_file and _db_confirm:
         import shutil as _shutil
+        import gzip as _gzip
+        import zipfile as _zipfile
+        import io as _io_restore
         from config import DATABASE_FILE as _DB_PATH
         try:
             _os_up.makedirs(_os_up.path.dirname(_DB_PATH), exist_ok=True)
             _backup_path = _DB_PATH + ".bak"
             if _os_up.path.exists(_DB_PATH):
                 _shutil.copy2(_DB_PATH, _backup_path)
+
+            _raw_bytes = _db_file.getvalue()
+            _name_lower = _db_file.name.lower()
+
+            if _name_lower.endswith(".gz"):
+                _db_bytes = _gzip.decompress(_raw_bytes)
+            elif _name_lower.endswith(".zip"):
+                with _zipfile.ZipFile(_io_restore.BytesIO(_raw_bytes)) as _zf:
+                    _db_members = [n for n in _zf.namelist() if n.lower().endswith(".db")]
+                    if not _db_members:
+                        raise ValueError("No .db file found inside the uploaded zip.")
+                    _db_bytes = _zf.read(_db_members[0])
+            else:
+                _db_bytes = _raw_bytes
+
             with open(_DB_PATH, "wb") as _f:
-                _f.write(_db_file.getbuffer())
+                _f.write(_db_bytes)
             st.cache_data.clear()
-            st.success(f"✅ Database restored successfully! ({_db_file.size:,} bytes written)")
+            st.success(
+                f"✅ Database restored successfully! "
+                f"({len(_db_bytes):,} bytes written"
+                f"{f', {len(_raw_bytes):,} bytes uploaded' if _raw_bytes != _db_bytes else ''})"
+            )
             st.info("A backup of the previous database was saved as bankflow.db.bak")
         except Exception as _e:
             st.error(f"❌ Restore failed: {_e}")
