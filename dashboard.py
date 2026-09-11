@@ -111,7 +111,7 @@ def _cached_inv_header_totals():
         "mf": sum(r["current_value"] for r in _d if r["scheme_type"] == "MF"),
     }
 
-from queries.cashflow_queries import fetch_cf
+from queries.cashflow_queries import fetch_cf, get_mf_fd_cash_asof
 from tabs.overview import render_overview
 from tabs.review_queue import render_review_queue
 
@@ -3168,9 +3168,17 @@ elif selected_tab == "Cash Flow":
         if "Uncategorized" in cf["payouts"]:
             payouts_ordered["Uncategorized"] = cf["payouts"]["Uncategorized"]
 
+        _ob_extra = get_mf_fd_cash_asof(cf_entity, cf["opening_asof_date"], DATABASE_FILE)
+        _opening_combined = (cf["total_opening"] + _ob_extra["mf"]
+                             + _ob_extra["fd"] + _ob_extra["cash"])
         _cf_section(
-            "Opening Balance", cf["total_opening"],
-            {f"Bank ({k})": v for k, v in cf["opening_balances"].items()},
+            "Opening Balance", _opening_combined,
+            {
+                **{f"Bank ({k})": v for k, v in cf["opening_balances"].items()},
+                "Mutual Fund Balance":   _ob_extra["mf"],
+                "Fixed Deposit Balance": _ob_extra["fd"],
+                "Cash at Stores":        _ob_extra["cash"],
+            },
             "cf_ob_open", "btn_cf_ob", section_cls="cf-ob", section_bg="#DBEAFE"
         )
         # ── Add Receipts — GROUP → FINAL GROUP hierarchy ─────────────────
@@ -3297,14 +3305,23 @@ elif selected_tab == "Cash Flow":
                         f'{fmt_cf(_rval)}</div>',
                         unsafe_allow_html=True)
 
+        _cb_extra = get_mf_fd_cash_asof(cf_entity, cf_month_to, DATABASE_FILE)
+        _closing_combined = (cf["total_closing"] + _cb_extra["mf"]
+                             + _cb_extra["fd"] + _cb_extra["cash"])
         _cf_section(
-            "Closing Balance", cf["total_closing"],
-            {f"Bank ({k})": v for k, v in cf["closing_balances"].items()},
+            "Closing Balance", _closing_combined,
+            {
+                **{f"Bank ({k})": v for k, v in cf["closing_balances"].items()},
+                "Mutual Fund Balance":   _cb_extra["mf"],
+                "Fixed Deposit Balance": _cb_extra["fd"],
+                "Cash at Stores":        _cb_extra["cash"],
+            },
             "cf_cb_open", "btn_cf_cb", section_cls="cf-cb", section_bg="#DBEAFE"
         )
 
-        # NET CASH POSITION — Receipts minus Payouts, excludes Investment
-        _net     = cf["net_cash_position"]
+        # NET CASH POSITION — new Closing Balance TOTAL minus new Opening Balance TOTAL
+        # (each TOTAL = Bank + Mutual Fund + Fixed Deposit + Cash at Stores)
+        _net     = _closing_combined - _opening_combined
         _net_cls = "pos" if _net >= 0 else "neg"
         st.markdown(f"""
 <div class="cf-net {_net_cls}">
@@ -3312,14 +3329,17 @@ elif selected_tab == "Cash Flow":
   <span>{_inr(_net)}</span>
 </div>""", unsafe_allow_html=True)
 
-        # TALLY CHECK — formula closing vs actual last DB balance
-        # (closing is now computed, so compare against DB to detect data gaps)
-        _tally     = cf["total_closing"]
-        _db_actual = get_closing_balance(
+        # TALLY CHECK — computed Closing TOTAL (combined) vs actual DB Closing (combined)
+        # MF/FD/Cash are identical carry-forward figures on both sides, so this
+        # reduces to the same bank formula-vs-actual check as before, now
+        # validating the combined total the tab actually displays.
+        _tally         = _closing_combined
+        _db_actual_bank = get_closing_balance(
             entity=cf_entity,
             date_from="1900-01-01",
             date_to=str(cf_month_to),
         )["total"] or 0
+        _db_actual = _db_actual_bank + _cb_extra["mf"] + _cb_extra["fd"] + _cb_extra["cash"]
         _diff   = round(_tally - _db_actual, 2)
         _t_ok   = abs(_diff) <= 1
         _t_icon = "✅" if _t_ok else "⚠️"
@@ -3380,7 +3400,10 @@ elif selected_tab == "Cash Flow":
                 _xlr("Opening Balance", style="header")
                 for k, v in cf["opening_balances"].items():
                     _xlr(f"Bank ({k})", v, indent=1)
-                _xlr("Total Opening Balance", cf["total_opening"], style="total")
+                _xlr("Mutual Fund Balance", _ob_extra["mf"], indent=1)
+                _xlr("Fixed Deposit Balance", _ob_extra["fd"], indent=1)
+                _xlr("Cash at Stores", _ob_extra["cash"], indent=1)
+                _xlr("Total Opening Balance", _opening_combined, style="total")
                 _xlr("Add Receipts:", style="header")
                 for k, v in receipts_ordered.items():
                     _xlr(k, v, indent=1)
@@ -3394,8 +3417,11 @@ elif selected_tab == "Cash Flow":
                 _xlr("Closing Balance", style="header")
                 for k, v in cf["closing_balances"].items():
                     _xlr(f"Bank ({k})", v, indent=1)
-                _xlr("Total Closing Balance", cf["total_closing"], style="total")
-                _xlr("Net Cash Position", cf["net_cash_position"], style="net")
+                _xlr("Mutual Fund Balance", _cb_extra["mf"], indent=1)
+                _xlr("Fixed Deposit Balance", _cb_extra["fd"], indent=1)
+                _xlr("Cash at Stores", _cb_extra["cash"], indent=1)
+                _xlr("Total Closing Balance", _closing_combined, style="total")
+                _xlr("Net Cash Position", _net, style="net")
                 out = io.BytesIO()
                 wb.save(out)
                 return out.getvalue()
@@ -3475,7 +3501,31 @@ elif selected_tab == "Cash Flow":
         _ob_totals = [sum(_bank_open[_wi].values())  for _wi in range(4)]
         _cb_totals = [sum(_bank_close[_wi].values()) for _wi in range(4)]
 
-        # Tally diffs: formula-computed closing vs actual last DB balance per week
+        # MF / FD / Cash at Stores as-on each week's boundary — same as-of
+        # carry-forward functions as the header banner / Summary tab.
+        # Closing[n] as-on date == Opening[n+1] as-on date (day before next
+        # week start == this week's end), so W1's closing figures are simply
+        # reused as W2's opening, matching the per-bank chaining above.
+        _mfc_close = [get_mf_fd_cash_asof(cf_entity, str(_w_ranges[_wi][1]), DATABASE_FILE)
+                      for _wi in range(4)]
+        _mfc_open  = {0: get_mf_fd_cash_asof(
+            cf_entity, str(_w_ranges[0][0] - datetime.timedelta(days=1)), DATABASE_FILE)}
+        for _wi in range(3):
+            _mfc_open[_wi + 1] = _mfc_close[_wi]
+
+        _ob_combined = [
+            _ob_totals[_wi] + _mfc_open[_wi]["mf"] + _mfc_open[_wi]["fd"] + _mfc_open[_wi]["cash"]
+            for _wi in range(4)
+        ]
+        _cb_combined = [
+            _cb_totals[_wi] + _mfc_close[_wi]["mf"] + _mfc_close[_wi]["fd"] + _mfc_close[_wi]["cash"]
+            for _wi in range(4)
+        ]
+
+        # Tally diffs: computed Closing TOTAL (combined) vs actual DB Closing (combined)
+        # per week. MF/FD/Cash are identical carry-forward figures on both sides,
+        # so this validates the same bank formula-vs-actual gap as before —
+        # now against the combined total the tab actually displays.
         _db_actual_close = [
             get_closing_balance(
                 entity=cf_entity,
@@ -3484,8 +3534,12 @@ elif selected_tab == "Cash Flow":
             )["total"] or 0
             for _wi in range(4)
         ]
+        _db_combined_close = [
+            _db_actual_close[_wi] + _mfc_close[_wi]["mf"] + _mfc_close[_wi]["fd"] + _mfc_close[_wi]["cash"]
+            for _wi in range(4)
+        ]
         for _wi in range(4):
-            _w_data[_wi]["tally_diff"] = round(_cb_totals[_wi] - _db_actual_close[_wi], 2)
+            _w_data[_wi]["tally_diff"] = round(_cb_combined[_wi] - _db_combined_close[_wi], 2)
 
         # All unique categories across all weeks — Uncategorized always last
         _all_rec_cats = []
@@ -3557,12 +3611,12 @@ elif selected_tab == "Cash Flow":
             with _ob_r[_i + 2]:
                 st.markdown(
                     f'<div class="cf-wk-val bold" style="background:{_SEC["opening"]["bg"]};'
-                    f'color:{_SEC["opening"]["text"]};">{_inr(_ob_totals[_i])}</div>',
+                    f'color:{_SEC["opening"]["text"]};">{_inr(_ob_combined[_i])}</div>',
                     unsafe_allow_html=True)
         with _ob_r[6]:
             st.markdown(
                 f'<div class="cf-wk-val bold" style="background:{_SEC["opening"]["bg"]};'
-                f'color:{_SEC["opening"]["text"]};">{_inr(_ob_totals[0])}</div>',
+                f'color:{_SEC["opening"]["text"]};">{_inr(_ob_combined[0])}</div>',
                 unsafe_allow_html=True)
         if st.session_state["wcf_ob_open"]:
             for _bk in sorted(_bank_open[0]):
@@ -3582,6 +3636,26 @@ elif selected_tab == "Cash Flow":
                     st.markdown(
                         f'<div class="cf-wk-val total">'
                         f'{_inr(_bank_open[0].get(_bk, 0))}</div>',
+                        unsafe_allow_html=True)
+            for _label, _mfc_key in [("Mutual Fund Balance", "mf"),
+                                      ("Fixed Deposit Balance", "fd"),
+                                      ("Cash at Stores", "cash")]:
+                _mr = st.columns(CF_COLS)
+                with _mr[1]:
+                    st.markdown(f'<div class="cf-detail">{_label}</div>',
+                                unsafe_allow_html=True)
+                for _i in range(4):
+                    _mov = _mfc_open[_i][_mfc_key]
+                    with _mr[_i + 2]:
+                        _dash_cls = " dim" if not _mov else ""
+                        st.markdown(
+                            f'<div class="cf-wk-val{_dash_cls}">'
+                            f'{_inr(_mov) if _mov else "—"}</div>',
+                            unsafe_allow_html=True)
+                with _mr[6]:
+                    st.markdown(
+                        f'<div class="cf-wk-val total">'
+                        f'{_inr(_mfc_open[0][_mfc_key])}</div>',
                         unsafe_allow_html=True)
         st.markdown(
             '<hr class="cf-divider-sm">',
@@ -3819,12 +3893,12 @@ elif selected_tab == "Cash Flow":
             with _cb_r[_i + 2]:
                 st.markdown(
                     f'<div class="cf-wk-val bold" style="background:{_SEC["closing"]["bg"]};'
-                    f'color:{_SEC["closing"]["text"]};">{_inr(_cb_totals[_i])}</div>',
+                    f'color:{_SEC["closing"]["text"]};">{_inr(_cb_combined[_i])}</div>',
                     unsafe_allow_html=True)
         with _cb_r[6]:
             st.markdown(
                 f'<div class="cf-wk-val bold" style="background:{_SEC["closing"]["bg"]};'
-                f'color:{_SEC["closing"]["text"]};">{_inr(_cb_totals[3])}</div>',
+                f'color:{_SEC["closing"]["text"]};">{_inr(_cb_combined[3])}</div>',
                 unsafe_allow_html=True)
         if st.session_state["wcf_cb_open"]:
             for _bk in sorted(_bank_close[0]):
@@ -3845,6 +3919,26 @@ elif selected_tab == "Cash Flow":
                         f'<div class="cf-wk-val bold total">'
                         f'{_inr(_bank_close[3].get(_bk, 0))}</div>',
                         unsafe_allow_html=True)
+            for _label, _mfc_key in [("Mutual Fund Balance", "mf"),
+                                      ("Fixed Deposit Balance", "fd"),
+                                      ("Cash at Stores", "cash")]:
+                _mcr = st.columns(CF_COLS)
+                with _mcr[1]:
+                    st.markdown(f'<div class="cf-detail">{_label}</div>',
+                                unsafe_allow_html=True)
+                for _i in range(4):
+                    _mcv = _mfc_close[_i][_mfc_key]
+                    with _mcr[_i + 2]:
+                        _d2 = " dim" if not _mcv else ""
+                        st.markdown(
+                            f'<div class="cf-wk-val{_d2}">'
+                            f'{_inr(_mcv) if _mcv else "—"}</div>',
+                            unsafe_allow_html=True)
+                with _mcr[6]:
+                    st.markdown(
+                        f'<div class="cf-wk-val bold total">'
+                        f'{_inr(_mfc_close[3][_mfc_key])}</div>',
+                        unsafe_allow_html=True)
         st.markdown(
             '<hr class="cf-divider-sm">',
             unsafe_allow_html=True)
@@ -3855,11 +3949,11 @@ elif selected_tab == "Cash Flow":
             st.markdown(
                 '<div class="cf-wk-net-label">NET CASH POSITION</div>',
                 unsafe_allow_html=True)
-        _total_wnet = sum(
-            _w_data[_wi]["total_receipts"] - _w_data[_wi]["total_payouts"]
-            for _wi in range(4))
-        for _i, _wd in enumerate(_w_data):
-            _wn     = _wd["total_receipts"] - _wd["total_payouts"]
+        # NET CASH POSITION = new Closing Balance TOTAL minus new Opening Balance
+        # TOTAL, per week (each TOTAL = Bank + Mutual Fund + Fixed Deposit + Cash).
+        _wnet_vals  = [_cb_combined[_wi] - _ob_combined[_wi] for _wi in range(4)]
+        _total_wnet = sum(_wnet_vals)
+        for _i, _wn in enumerate(_wnet_vals):
             _wn_sec = "net_pos" if _wn >= 0 else "net_neg"
             with _wnet_r[_i + 2]:
                 st.markdown(
@@ -3893,7 +3987,7 @@ elif selected_tab == "Cash Flow":
                     f'<div style="text-align:center;padding:3px 2px;background:{_tbg_t};'
                     f'border-radius:4px;font-size:13px;" title="{_tip}">{_tic}</div>',
                     unsafe_allow_html=True)
-        _total_tdif = round(_cb_totals[3] - _db_actual_close[3], 2)
+        _total_tdif = round(_cb_combined[3] - _db_combined_close[3], 2)
         with _tally_r[6]:
             _gt_ok  = abs(_total_tdif) <= 1
             _gt_tip = "Tallied" if _gt_ok else fmt_cf(abs(_total_tdif))

@@ -301,4 +301,86 @@ def fetch_cf(entity, d_from, d_to, db_file, financial_year=None):
         "investment_net":          investment_net,
         "investment_inflow":       investment_inflow,
         "investment_outflow":      investment_outflow,
+        # Date the Opening Balance bank rows above are computed as-on
+        # (day before the period starts) -- exposed so the Cash Flow tab
+        # can pull MF/FD/Cash for that exact same date, no separate logic.
+        "opening_asof_date":       d_before,
     }
+
+
+def get_investment_mf_asof(entity, as_of_date, db_file=None):
+    """
+    MF-only portion of the combined FD+MF figure that
+    database.get_entity_investment_asof() returns for the same
+    entity/date. Same tables (investment_register, manual_investments,
+    transactions + investment_txn_mapping) and the same as-of-date
+    carry-forward rule, filtered to scheme_type='MF'.
+
+    Used only so the Cash Flow tab can show Mutual Fund / Fixed Deposit
+    as two separate rows while guaranteeing they sum back exactly to
+    get_entity_investment_asof()'s existing combined result -- FD is
+    derived as combined - MF in get_mf_fd_cash_asof() below, so there is
+    no way for the two to drift apart.
+    """
+    if db_file is None:
+        from config import DATABASE_FILE
+        db_file = DATABASE_FILE
+    conn = sqlite3.connect(db_file)
+    conn.row_factory = sqlite3.Row
+
+    reg_row = conn.execute("""
+        SELECT SUM(opening_value) as total
+        FROM investment_register WHERE entity=? AND scheme_type='MF'
+    """, [entity]).fetchone()
+    opening = (reg_row["total"] or 0) if reg_row else 0
+
+    txn_row = conn.execute("""
+        SELECT
+            ROUND(SUM(CASE WHEN t.debit>0  THEN t.debit  ELSE 0 END),2) as inv,
+            ROUND(SUM(CASE WHEN t.credit>0 THEN t.credit ELSE 0 END),2) as red
+        FROM transactions t
+        JOIN investment_txn_mapping m ON t.id = m.transaction_id
+        WHERE t.entity=?
+        AND UPPER(t.main_group)='INVESTMENT'
+        AND m.scheme_type='MF'
+        AND t.date <= ?
+    """, [entity, as_of_date]).fetchone()
+    txn_net = ((txn_row["inv"] or 0) - (txn_row["red"] or 0)) if txn_row else 0
+
+    man_row = conn.execute("""
+        SELECT
+            SUM(CASE WHEN entry_type='Invested' THEN amount ELSE 0 END) as inv,
+            SUM(CASE WHEN entry_type='Redeemed' THEN amount ELSE 0 END) as red
+        FROM manual_investments
+        WHERE entity=? AND scheme_type='MF' AND entry_date <= ?
+    """, [entity, as_of_date]).fetchone()
+    man_net = ((man_row["inv"] or 0) - (man_row["red"] or 0)) if man_row else 0
+
+    conn.close()
+    return opening + txn_net + man_net
+
+
+def get_mf_fd_cash_asof(entity, as_of_date, db_file=None):
+    """
+    Mutual Fund, Fixed Deposit and Cash-at-Stores balances AS ON
+    as_of_date, for the Cash Flow tab's Opening/Closing Balance
+    breakdown (added so those totals match the header banner's Total
+    Cash Position and the Summary tab's Grand Total for the same
+    date/entity).
+
+    Reuses the exact same functions the header banner and Summary tab's
+    Account Balance Summary already use for this purpose --
+    database.get_entity_investment_asof() and database.get_cash_asof()
+    -- with the same carry-forward "as on date" rule, aggregated across
+    Stores+Ventures when entity is None/"All" exactly like those two
+    views already do. Neither of those two functions is modified.
+    """
+    from database import get_entity_investment_asof, get_cash_asof
+    entities = ["Stores", "Ventures"] if not entity or entity == "All" else [entity]
+
+    combined_inv = sum(get_entity_investment_asof(e, as_of_date) for e in entities)
+    mf           = sum(get_investment_mf_asof(e, as_of_date, db_file) for e in entities)
+    fd           = combined_inv - mf
+    cash         = sum(get_cash_asof(e, as_of_date) for e in entities)
+
+    return {"mf": mf, "fd": fd, "cash": cash, "combined_investment": combined_inv}
