@@ -22,7 +22,7 @@ from database import (
     set_cash_entry, get_cash_asof, get_cash_history,
     delete_cash_entry, import_cash_excel,
     get_investment_transactions, tag_investment_transaction,
-    get_investment_movements,
+    get_investment_movements, get_investment_events, get_daywise_totals,
     add_manual_investment, get_manual_investments,
     delete_manual_investment, get_manual_investment_totals,
     get_entity_closing_balance, get_summary_with_bank,
@@ -46,7 +46,8 @@ FY_BOUNDS  = {
     "FY2526": (datetime.date(2025, 4, 1), datetime.date(2026, 3, 31)),
     "FY2627": (datetime.date(2026, 4, 1), datetime.date(2027, 3, 31)),
 }
-from utils.formatters import fmt_inr, _inr, _td, _td_dash
+from utils.formatters import fmt_inr, _inr, _td, _td_dash, fmt_cr, fmt_cf
+from utils.ui import rcol, amount_config
 
 # ── Cached DB wrappers ────────────────────────────────────────────────────────
 @st.cache_data(ttl=300)
@@ -85,12 +86,13 @@ def _cached_entity_balance(entity):
     return get_entity_closing_balance(entity)
 
 @st.cache_data(ttl=300)
-def _cached_count(entity, bank, month, financial_year):
+def _cached_count(entity, bank, month, financial_year, date_from=None, date_to=None):
     return get_transaction_count(
         entity=entity if entity != "All" else None,
         bank=bank     if bank   != "All" else None,
         month=month   if month  != "All" else None,
         financial_year=financial_year,
+        date_from=date_from, date_to=date_to,
     )
 
 @st.cache_data(ttl=300)
@@ -112,10 +114,157 @@ def _cached_inv_header_totals():
     }
 
 from queries.cashflow_queries import fetch_cf, get_mf_fd_cash_asof
+
+# ── Cache every read-only data query (5 min; any write calls st.cache_data.clear()) ──
+for _fn_name in (
+    "get_monthly_trend", "get_yoy_comparison", "get_top_expenses_comparison",
+    "get_weekly_cash_position", "get_account_balances_asof",
+    "get_entity_investment_asof", "get_entity_bank_balance_asof", "get_cash_asof",
+    "get_cash_history", "get_latest_data_date", "get_closing_balance",
+    "get_all_categories", "get_paginated_transactions", "get_all_transactions",
+    "get_investment_events", "get_investment_movements", "get_investment_register",
+    "get_manual_investments", "get_manual_investment_totals",
+    "get_investment_transactions", "get_investment_summary",
+    "get_uncategorized", "get_missing_statements", "get_large_debits",
+    "get_transfer_reconciliation", "get_upload_trail", "get_category_audit",
+    "fetch_cf", "get_mf_fd_cash_asof", "get_daywise_totals",
+):
+    globals()[_fn_name] = st.cache_data(ttl=300, show_spinner=False)(globals()[_fn_name])
 from tabs.overview import render_overview
 from tabs.review_queue import render_review_queue
 
 # ── Live-view badge — shown in tabs that are NOT filtered by FY ───────────────
+
+CF_STYLE = """
+<span class="cf-scope"></span>
+<style>
+/* ═══ Cash Flow tab — roomy card layout ═══════════════════════════════════ */
+[data-testid="stVerticalBlock"]:has(> [data-testid="stElementContainer"] .cf-scope) { gap: 0.5rem !important; }
+[data-testid="stVerticalBlock"]:has(> [data-testid="stElementContainer"] .cf-scope)
+  > [data-testid="stLayoutWrapper"] > [data-testid="stHorizontalBlock"]:not(:has(.nav-active-indicator)) {
+  gap: 0 !important; align-items: stretch !important;
+}
+[data-testid="stVerticalBlock"]:has(> [data-testid="stElementContainer"] .cf-scope)
+  > [data-testid="stLayoutWrapper"] > [data-testid="stHorizontalBlock"]:not(:has(.nav-active-indicator))
+  > [data-testid="stColumn"] > [data-testid="stVerticalBlock"] { height: 100%; justify-content: center; }
+/* Streamlit gives markdown a -16px bottom margin, which makes tall custom bars overlap the next row */
+[data-testid="stMarkdownContainer"]:has(> div[class^="cf-"]) { margin-bottom: 0 !important; }
+/* detail lines sit closer together than section bars */
+[data-testid="stLayoutWrapper"]:has(.cf-sub-row), [data-testid="stLayoutWrapper"]:has(.cf-detail),
+[data-testid="stLayoutWrapper"]:has(.cf-wk-sub-lbl) { margin-top: -0.5rem; }
+[data-testid="stLayoutWrapper"]:has(.cf-recon-lbl) { margin-top: -0.3rem; }
+
+/* ── statement heading ── */
+.cf-stmt-head {
+  display: flex; align-items: center; justify-content: space-between;
+  margin: 14px 0 4px; padding: 0 4px;
+}
+.cf-stmt-title { font-size: 12px; font-weight: 800; letter-spacing: 0.16em; text-transform: uppercase; color: #1B2B4B; }
+.cf-stmt-range {
+  font-size: 12px; font-weight: 600; color: #3D4F66; background: #FFFFFF;
+  border: 1px solid #E2E7EF; border-radius: 20px; padding: 5px 14px;
+}
+
+/* ── +/- toggle buttons ── */
+[class*="st-key-btn_"] button, [class*="st-key-wbtn_"] button {
+  width: 34px !important; min-height: 34px !important; height: 34px !important;
+  padding: 0 !important; margin-left: 8px; border-radius: 10px !important;
+  border: 1px solid #C8D3E0 !important; color: #1B2B4B !important;
+  font-weight: 700 !important; font-size: 16px !important; background: #FFFFFF !important;
+  box-shadow: 0 1px 2px rgba(10,22,40,0.06) !important;
+}
+[class*="st-key-btn_"] button:hover, [class*="st-key-wbtn_"] button:hover {
+  background: #1B2B4B !important; color: #FFFFFF !important; border-color: #1B2B4B !important;
+}
+[class*="st-key-btn_"] > div, [class*="st-key-wbtn_"] > div { display: flex; align-items: center; }
+
+/* Expand / Collapse — compact */
+.st-key-cf_expand_all button, .st-key-cf_collapse_all button {
+  min-height: 34px !important; height: 34px !important; padding: 0 14px !important;
+  font-size: 12.5px !important; border-radius: 10px !important; white-space: nowrap;
+}
+.st-key-cf_expand_all, .st-key-cf_collapse_all { margin-right: 6px; }
+
+/* ── section bars ── */
+.cf-section-label {
+  display: flex !important; align-items: center; min-height: 58px;
+  padding: 0 24px !important; font-size: 15px !important; font-weight: 700;
+  letter-spacing: 0.02em; border-radius: 14px 0 0 14px !important;
+  box-shadow: 0 1px 3px rgba(10,22,40,0.05);
+}
+.cf-section-total {
+  display: flex !important; align-items: center; justify-content: flex-end;
+  min-height: 58px; padding: 0 26px !important; font-size: 18px !important;
+  font-weight: 800; font-variant-numeric: tabular-nums; letter-spacing: -0.3px !important;
+  border-radius: 0 14px 14px 0 !important; box-shadow: 0 1px 3px rgba(10,22,40,0.05);
+}
+.cf-ob, .cf-cb   { background: #EAF0FA !important; color: #1B2B4B !important; border-left: 5px solid #1B2B4B !important; }
+.cf-rec          { background: #ECFDF3 !important; color: #166534 !important; border-left: 5px solid #22C55E !important; }
+.cf-pay          { background: #FEF0F0 !important; color: #991B1B !important; border-left: 5px solid #EF4444 !important; }
+.cf-section-total.sky { background: #EAF0FA !important; color: #1B2B4B !important; }
+.cf-section-total.pos { background: #ECFDF3 !important; color: #166534 !important; }
+.cf-section-total.neg { background: #FEF0F0 !important; color: #991B1B !important; }
+
+/* ── group rows ── */
+.cf-grp-row, .cf-grp-val, .cf-wk-grp-lbl, .cf-wk-grp-val {
+  display: flex !important; align-items: center; min-height: 46px;
+  background: #F6F8FB !important; font-weight: 600 !important; font-size: 13.5px !important;
+  color: #1B2B4B !important; font-variant-numeric: tabular-nums;
+}
+.cf-grp-row, .cf-wk-grp-lbl { padding: 0 20px !important; border-left: 4px solid #93A4BF; border-radius: 10px 0 0 10px; }
+.cf-grp-val, .cf-wk-grp-val { justify-content: flex-end; padding: 0 24px !important; border-radius: 0 10px 10px 0; }
+.cf-wk-grp-val { border-radius: 0; padding: 0 16px !important; }
+
+/* ── detail rows ── */
+.cf-sub-row, .cf-sub-val, .cf-detail, .cf-dval, .cf-wk-sub-lbl, .cf-wk-sub-val {
+  display: flex !important; align-items: center; min-height: 40px;
+  font-size: 13px !important; color: #3D4F66 !important;
+  background: #FFFFFF; border-bottom: 1px solid #EDF0F5;
+  font-variant-numeric: tabular-nums;
+}
+.cf-sub-row, .cf-detail, .cf-wk-sub-lbl { padding: 0 16px 0 44px !important; }
+.cf-sub-val, .cf-dval, .cf-wk-sub-val { justify-content: flex-end; padding: 0 26px !important; }
+.cf-sub-row.unc, .cf-sub-val.unc, .cf-detail.unc, .cf-dval.unc { color: #6B7A90 !important; font-style: italic; }
+
+/* ── reconciling lines ── */
+.cf-recon-lbl {
+  display: flex; align-items: center; min-height: 46px; padding: 0 20px;
+  font-size: 13.5px; font-weight: 600; color: #1B2B4B; background: #F6F8FB;
+  border-left: 4px solid #93A4BF; border-radius: 10px 0 0 10px;
+}
+.cf-recon-val {
+  display: flex; align-items: center; justify-content: flex-end; min-height: 46px;
+  padding: 0 24px; font-size: 14px; font-weight: 700; background: #F6F8FB;
+  border-radius: 0 10px 10px 0; font-variant-numeric: tabular-nums;
+}
+
+/* ── weekly table ── */
+.cf-wk-hdr {
+  display: flex; align-items: center; justify-content: flex-end; min-height: 42px;
+  padding: 0 14px !important; background: #1B2B4B !important; color: #FFFFFF !important;
+  white-space: nowrap; font-size: 11.5px !important; font-weight: 700; letter-spacing: 0.03em; border-radius: 0 !important;
+}
+.cf-wk-hdr.ttl { background: #2E4A72 !important; }
+.cf-wk-val {
+  display: flex !important; align-items: center; justify-content: flex-end; min-height: 50px;
+  padding: 0 16px !important; font-variant-numeric: tabular-nums;
+}
+
+[data-testid="stLayoutWrapper"]:has(.cf-detail) .cf-wk-val {
+  min-height: 40px; font-size: 13px; font-weight: 500; color: #3D4F66; background: #FFFFFF;
+  border-bottom: 1px solid #EDF0F5;
+}
+
+/* ── net movement + tally ── */
+.cf-net {
+  border-radius: 16px !important; border-width: 2px 0 !important; padding: 20px 28px !important;
+  margin-top: 14px !important; font-size: 15px !important; box-shadow: 0 2px 8px rgba(10,22,40,0.06) !important;
+}
+.cf-net span:last-child { font-size: 26px !important; font-weight: 800; font-variant-numeric: tabular-nums; letter-spacing: -0.6px; }
+.cf-tally { border-radius: 12px !important; padding: 10px 18px !important; margin-top: 10px !important; }
+</style>
+"""
+
 LIVE_BANNER = """
 <div style="display:inline-flex; align-items:center; gap:8px;
      background:#F0FDF4; border:1px solid #86EFAC;
@@ -133,37 +282,6 @@ LIVE_BANNER = """
 }
 </style>
 """
-
-
-def fmt_cr(x):
-    """Format number in Crores with 2 decimals. e.g. 52700000 → ₹5.27 Cr"""
-    try:
-        x = float(x)
-        if x == 0:
-            return "₹0"
-        sign = "-" if x < 0 else ""
-        x = abs(x)
-        if x >= 1e7:
-            return f"{sign}₹{x/1e7:.2f} Cr"
-        elif x >= 1e5:
-            return f"{sign}₹{x/1e5:.2f} L"
-        else:
-            return f"{sign}₹{x:,.0f}"
-    except Exception:
-        return str(x)
-
-
-def fmt_cf(x):
-    """Cash Flow formatter — negative as (₹X,XX,XXX), positive as ₹X,XX,XXX."""
-    try:
-        x = float(x)
-        if x == 0:
-            return "—"
-        if x < 0:
-            return f"(₹{abs(x):,.0f})"
-        return f"₹{x:,.0f}"
-    except Exception:
-        return str(x) if x else "—"
 
 
 st.set_page_config(
@@ -267,7 +385,7 @@ html, body, [class*="css"] {
 }
 
 .block-container {
-  padding-top: 0 !important;
+  padding-top: 3.5rem !important;
   padding-bottom: 1.5rem !important;
   max-width: 100% !important;
 }
@@ -1456,7 +1574,7 @@ hr { border-color: var(--border-xs) !important; margin: 10px 0 !important; }
    STREAMLIT CHROME CLEANUP  (Phase 5 refined)
 ═══════════════════════════════════════════════════════════ */
 /* Tighten main area top padding */
-.main .block-container { padding-top: 0 !important; }
+.main .block-container { padding-top: 3.5rem !important; }
 
 /* Remove extra whitespace above first element */
 .main > div:first-child { padding-top: 0 !important; margin-top: 0 !important; }
@@ -1573,9 +1691,11 @@ _first_of_month = _today.replace(day=1)
 import os as _os
 LOGO_PATH = _os.path.join(_os.path.dirname(__file__), "logo.png")
 if not _os.path.exists(LOGO_PATH):
-    _fallback = _os.path.join(_os.path.dirname(__file__), "citykart_logo.png")
-    if _os.path.exists(_fallback):
-        LOGO_PATH = _fallback
+    for _fb_name in ("citykart_logo.png", "citykart_logo.PNG"):
+        _fallback = _os.path.join(_os.path.dirname(__file__), _fb_name)
+        if _os.path.exists(_fallback):
+            LOGO_PATH = _fallback
+            break
 
 if _os.path.exists(LOGO_PATH):
     st.sidebar.image(LOGO_PATH, use_container_width=True)
@@ -1730,7 +1850,7 @@ if by_bank_bal:
         _dt_vals     = [v for v in by_bank_dt.values() if v]
         closing_date = max(_dt_vals) if _dt_vals else ""
         _cb_sub      = " | ".join(
-            f"{bk}: ₹{v:,.0f}" for bk, v in sorted(by_bank_bal.items())
+            f"{bk}: {fmt_inr(v)}" for bk, v in sorted(by_bank_bal.items())
         )
 else:
     closing_balance = 0.0
@@ -1771,7 +1891,7 @@ total_cash_position = (stores_bank_asof + ventures_bank_asof +
 as_of_display = datetime.date.fromisoformat(as_of_date).strftime("%d %b %Y")
 
 # ─── Transaction count (lightweight SQL COUNT — no row loading) ───────────────
-txn_count = _cached_count(sel_entity, sel_bank, sel_month, None)
+txn_count = _cached_count(sel_entity, sel_bank, sel_month, None, date_from, date_to)
 
 # Period label pill
 if use_date_range:
@@ -1958,9 +2078,9 @@ div[data-testid="stHorizontalBlock"]:has(.nav-active-indicator) .stButton > butt
     border: none !important;
     border-radius: 0 !important;
     color: #6B7A90 !important;
-    font-size: 13px !important;
+    font-size: 15px !important;
     font-weight: 500 !important;
-    padding: 12px 8px 10px !important;
+    padding: 14px 8px 12px !important;
     width: 100% !important;
     box-shadow: none !important;
     letter-spacing: 0.01em !important;
@@ -1973,10 +2093,26 @@ div[data-testid="stHorizontalBlock"]:has(.nav-active-indicator) .stButton > butt
 
 /* ── Active indicator line ── */
 .nav-active-indicator {
-    height: 3px;
+    height: 4px;
     background: #1B2B4B;
     border-radius: 2px 2px 0 0;
     margin: -4px 8px 0;
+}
+
+/* ── Nav label size + bold active label ── */
+div[data-testid="stHorizontalBlock"]:has(.nav-active-indicator) .stButton > button p {
+    font-size: 15px !important;
+}
+div[data-testid="stHorizontalBlock"]:has(.nav-active-indicator) .stButton > button[kind="primary"],
+div[data-testid="stHorizontalBlock"]:has(.nav-active-indicator) .stButton > button[data-testid="stBaseButton-primary"] {
+    background: transparent !important;
+    border: none !important;
+    color: #1B2B4B !important;
+}
+div[data-testid="stHorizontalBlock"]:has(.nav-active-indicator) .stButton > button[kind="primary"] p,
+div[data-testid="stHorizontalBlock"]:has(.nav-active-indicator) .stButton > button[data-testid="stBaseButton-primary"] p {
+    font-weight: 800 !important;
+    color: #1B2B4B !important;
 }
 
 /* ── Active button label ── */
@@ -1987,13 +2123,14 @@ div[data-testid="stHorizontalBlock"]:has(.nav-active-indicator) .stVerticalBlock
 </style>
 """, unsafe_allow_html=True)
 
-nav_options = ["Summary", "Cash Flow", "Transactions", "Uncategorised", "Exception Report", "Investments", "Upload"]
-nav_keys    = ["Summary", "Cash Flow", "Transactions", "Uncategorised", "Exception Report", "Investments", "Upload"]
+nav_options = ["Summary", "Cash Flow", "Investments", "Transactions", "Uncategorised", "Exception Report", "Upload"]
+nav_keys    = ["Summary", "Cash Flow", "Investments", "Transactions", "Uncategorised", "Exception Report", "Upload"]
 nav_cols = st.columns(len(nav_options))
 for i, (label, key) in enumerate(zip(nav_options, nav_keys)):
     with nav_cols[i]:
         is_active = st.session_state["active_tab"] == key
-        if st.button(label, key=f"nav_{key}", use_container_width=True):
+        if st.button(label, key=f"nav_{key}", use_container_width=True,
+                     type="primary" if is_active else "secondary"):
             st.session_state["switch_tab"] = key
             st.rerun()
         if is_active:
@@ -2023,7 +2160,7 @@ if selected_tab == "Summary":
                 acc["bank"],
                 acc["purpose"],
                 acc["bank_id"],
-                f'<div style="text-align:right;font-variant-numeric:tabular-nums;">₹{acc["balance"]:,.0f}</div>',
+                f'<div style="text-align:right;font-variant-numeric:tabular-nums;">{_inr(acc["balance"])}</div>',
             ]
             for _c, _v in zip(rcols, _vals):
                 with _c:
@@ -2037,7 +2174,7 @@ if selected_tab == "Summary":
                 for _c, _v in zip(ircols, [
                     f'<span class="abs-pill" style="background:#EDE9FE;color:#5B21B6;">INV</span> {entity_name}',
                     "Investments", "MF + FD", "—",
-                    f'<div style="text-align:right;color:#5B21B6;font-weight:700;">₹{_inv:,.0f}</div>',
+                    f'<div style="text-align:right;color:#5B21B6;font-weight:700;">{_inr(_inv)}</div>',
                 ]):
                     with _c:
                         st.markdown(_v, unsafe_allow_html=True)
@@ -2050,7 +2187,7 @@ if selected_tab == "Summary":
                 for _c, _v in zip(cash_cols_row, [
                     f'<span class="abs-pill" style="background:#CFFAFE;color:#0891B2;">CASH</span> {entity_name}',
                     "Cash", "Cash at Stores", "—",
-                    f'<div style="text-align:right;color:#0891B2;font-weight:700;">₹{cash_bal:,.0f}</div>',
+                    f'<div style="text-align:right;color:#0891B2;font-weight:700;">{_inr(cash_bal)}</div>',
                 ]):
                     with _c:
                         st.markdown(_v, unsafe_allow_html=True)
@@ -2061,7 +2198,7 @@ if selected_tab == "Summary":
             f'font-weight:700;color:#1B2B4B;display:flex;justify-content:space-between;'
             f'margin-bottom:8px;">'
             f'<span>{entity_name} Subtotal{" (Bank + Investments)" if show_investments else " (Bank)"}</span>'
-            f'<span>₹{entity_total:,.0f}</span></div>',
+            f'<span>{_inr(entity_total)}</span></div>',
             unsafe_allow_html=True)
         return entity_total
 
@@ -2108,269 +2245,67 @@ if selected_tab == "Summary":
         f'border-radius:6px;font-weight:800;font-size:14px;'
         f'display:flex;justify-content:space-between;">'
         f'<span>TOTAL CASH POSITION</span>'
-        f'<span>₹{_grand_total:,.0f}</span></div>',
+        f'<span>{fmt_inr(_grand_total)}</span></div>',
         unsafe_allow_html=True)
     st.markdown("<br>", unsafe_allow_html=True)
 
-    # ── Charts row ────────────────────────────────────────────────────────────
-    _ch_left, _ch_right = st.columns([3, 2])
+    # ── Day-wise total balance — ignores ALL sidebar filters (whole company) ──
+    st.markdown('<div class="section-header" style="margin:10px 0 6px;">Day-wise Total Balance</div>',
+                unsafe_allow_html=True)
+    _dw = get_daywise_totals()
+    if _dw:
+        _dw_df = pd.DataFrame(_dw)
+        _dw_show = pd.DataFrame({
+            "Date":             pd.to_datetime(_dw_df["date"]).dt.strftime("%d %b %Y"),
+            "Account balance":  _dw_df["bank"].apply(fmt_inr),
+            "FD balance":       _dw_df["fd"].apply(fmt_inr),
+            "Investment (MF)":  _dw_df["mf"].apply(fmt_inr),
+            "Cash at Stores":   _dw_df["cash"].apply(fmt_inr),
+            "Total balance":    _dw_df["total"].apply(fmt_inr),
+        })
+        st.dataframe(
+            _dw_show, use_container_width=True, hide_index=True, height=420,
+            column_config=amount_config(["Account balance", "FD balance", "Investment (MF)",
+                                         "Cash at Stores", "Total balance"]))
 
-    with _ch_left:
-        # Weekly treasury-style movement chart: grouped bars + net line overlay
-        st.markdown('<div class="card"><div class="card-title">Monthly Cash Movement</div>',
-                    unsafe_allow_html=True)
-        _by_month_chart = summary.get("by_month", [])
-        if _by_month_chart:
-            _df_w = pd.DataFrame(_by_month_chart).tail(12).copy()
-            _df_w["net"] = _df_w["inflow"] - _df_w["outflow"]
-            _fig_w = go.Figure()
-            _fig_w.add_trace(go.Bar(
-                name="Receipts", x=_df_w["month"], y=_df_w["inflow"],
-                marker=dict(color="#22C55E", opacity=0.72, line=dict(width=0)),
-                hovertemplate="<b>%{x}</b><br>Receipts: ₹%{y:,.0f}<extra></extra>"
-            ))
-            _fig_w.add_trace(go.Bar(
-                name="Payouts", x=_df_w["month"], y=_df_w["outflow"],
-                marker=dict(color="#F87171", opacity=0.72, line=dict(width=0)),
-                hovertemplate="<b>%{x}</b><br>Payouts: ₹%{y:,.0f}<extra></extra>"
-            ))
-            _fig_w.add_trace(go.Scatter(
-                name="Net", x=_df_w["month"], y=_df_w["net"],
-                mode="lines+markers",
-                line=dict(color="#1B2B4B", width=2.5),
-                marker=dict(size=5, color="#1B2B4B", symbol="circle"),
-                hovertemplate="<b>%{x}</b><br>Net: ₹%{y:,.0f}<extra></extra>"
-            ))
-            _fig_w.update_layout(
-                barmode="group", bargap=0.22, bargroupgap=0.06,
-                plot_bgcolor="#FFFFFF", paper_bgcolor="#FFFFFF",
-                font=dict(family="Inter", color="#4A5568", size=11),
-                legend=dict(
-                    orientation="h", yanchor="bottom", y=1.02,
-                    xanchor="right", x=1, font=dict(size=10),
-                    bgcolor="rgba(0,0,0,0)"
-                ),
-                xaxis=dict(
-                    showgrid=False, tickfont=dict(size=10),
-                    tickangle=-30, linecolor="#E2E8F0", showline=True
-                ),
-                yaxis=dict(
-                    showgrid=True, gridcolor="#F5F5F5", gridwidth=1,
-                    tickfont=dict(size=10), tickformat=",.0f",
-                    zeroline=True, zerolinecolor="#E2E8F0", zerolinewidth=1.5
-                ),
-                height=300,
-                margin=dict(l=8, r=8, t=30, b=10)
-            )
-            st.plotly_chart(_fig_w, use_container_width=True)
-        else:
-            st.info("No data yet. Drop bank statements to get started.")
-        st.markdown('</div>', unsafe_allow_html=True)
+        def _build_daywise_excel():
+            from openpyxl import Workbook
+            from openpyxl.styles import Font, PatternFill, Alignment
+            wb = Workbook()
+            ws = wb.active
+            ws.title = "Day-wise Balance"
+            ws.append(["Date", "Account balance", "FD balance", "Investment (MF)",
+                       "Cash at Stores", "Total balance"])
+            for c in ws[1]:
+                c.font = Font(bold=True, color="FFFFFF")
+                c.fill = PatternFill("solid", fgColor="1B2B4B")
+                c.alignment = Alignment(horizontal="center")
+            for r in _dw:
+                ws.append([datetime.date.fromisoformat(r["date"]),
+                           round(r["bank"], 2), round(r["fd"], 2), round(r["mf"], 2),
+                           round(r["cash"], 2), round(r["total"], 2)])
+            for row in ws.iter_rows(min_row=2):
+                row[0].number_format = "dd-mmm-yyyy"
+                for c in row[1:]:
+                    c.number_format = "#,##0;[Red]-#,##0"
+                row[5].font = Font(bold=True)
+            ws.column_dimensions["A"].width = 14
+            for col in "BCDEF":
+                ws.column_dimensions[col].width = 20
+            ws.freeze_panes = "A2"
+            buf = io.BytesIO()
+            wb.save(buf)
+            return buf.getvalue()
 
-    with _ch_right:
-        # Expenditure donut — category breakdown
-        st.markdown('<div class="card"><div class="card-title">Expenditure by Category</div>',
-                    unsafe_allow_html=True)
-        _by_cat = summary.get("by_category", [])
-        if _by_cat:
-            _df_c = pd.DataFrame(_by_cat)
-            _df_c = _df_c[_df_c["total"] > 0].copy()
-            _df_c_top = _df_c.head(8).copy()
-            if len(_df_c) > 8:
-                _others = _df_c.iloc[8:]["total"].sum()
-                _df_c_top = pd.concat([
-                    _df_c_top,
-                    pd.DataFrame([{"final_group": "Others", "total": _others}])
-                ], ignore_index=True)
-            _DONUT_COLORS = [
-                "#1B3A6B", "#3B82F6", "#60A5FA", "#93C5FD",
-                "#BFDBFE", "#1E40AF", "#2563EB", "#DBEAFE", "#E2E8F0"
-            ]
-            _tot_spend = _df_c["total"].sum()
-            _ctr = f"₹{_tot_spend/1e7:.1f}Cr" if _tot_spend >= 1e7 else f"₹{_tot_spend/1e5:.1f}L"
-            _fig_c = go.Figure(go.Pie(
-                labels=_df_c_top["final_group"],
-                values=_df_c_top["total"],
-                hole=0.62,
-                marker=dict(
-                    colors=_DONUT_COLORS[:len(_df_c_top)],
-                    line=dict(color="#FFFFFF", width=2)
-                ),
-                textinfo="none",
-                hovertemplate="<b>%{label}</b><br>₹%{value:,.0f}<br>%{percent}<extra></extra>"
-            ))
-            _fig_c.add_annotation(
-                text=f"{_ctr}<br><span style='font-size:9px'>Total Spend</span>",
-                x=0.5, y=0.5, showarrow=False,
-                font=dict(size=14, color="#1A202C", family="Inter"),
-                align="center"
-            )
-            _fig_c.update_layout(
-                plot_bgcolor="#FFFFFF", paper_bgcolor="#FFFFFF",
-                font=dict(family="Inter", color="#4A5568", size=11),
-                legend=dict(
-                    orientation="v", yanchor="middle", y=0.5,
-                    xanchor="left", x=1.02, font=dict(size=10),
-                    itemsizing="constant"
-                ),
-                height=300,
-                margin=dict(l=8, r=110, t=30, b=10),
-                showlegend=True
-            )
-            st.plotly_chart(_fig_c, use_container_width=True)
-        else:
-            st.info("No categorized data yet.")
-        st.markdown('</div>', unsafe_allow_html=True)
-
-    # ── Analysis charts (15-month trend, YoY, top expenses, weekly) ─────────────
-    import datetime as _dt
-    _cur_month = _latest_date[:7] if _latest_date else _dt.date.today().strftime("%Y-%m")
-
-    # Chart 1 — 15-month receipts vs payouts trend (full width)
-    _trend = get_monthly_trend(15)
-    if _trend:
-        _df_t = pd.DataFrame(_trend)
-        _fig_t = go.Figure()
-        _fig_t.add_trace(go.Bar(
-            name="Receipts", x=_df_t["month"],
-            y=_df_t["receipts"] / 1e7,
-            marker_color="#22C55E", opacity=0.8,
-            hovertemplate="%{x}<br>₹%{y:.2f} Cr<extra>Receipts</extra>"
-        ))
-        _fig_t.add_trace(go.Bar(
-            name="Payouts", x=_df_t["month"],
-            y=_df_t["payouts"] / 1e7,
-            marker_color="#F87171", opacity=0.8,
-            hovertemplate="%{x}<br>₹%{y:.2f} Cr<extra>Payouts</extra>"
-        ))
-        _fig_t.add_trace(go.Scatter(
-            name="Net", x=_df_t["month"],
-            y=(_df_t["receipts"] - _df_t["payouts"]) / 1e7,
-            mode="lines+markers",
-            line=dict(color="#1B2B4B", width=2),
-            hovertemplate="%{x}<br>Net ₹%{y:.2f} Cr<extra></extra>"
-        ))
-        _fig_t.update_layout(
-            title="15-Month Receipts vs Payouts (₹ Cr)",
-            barmode="group", height=300,
-            plot_bgcolor="#FFFFFF", paper_bgcolor="#FFFFFF",
-            font=dict(family="Inter", size=11),
-            legend=dict(orientation="h", y=1.1),
-            xaxis=dict(showgrid=False),
-            yaxis=dict(showgrid=True, gridcolor="#F0F0F0", ticksuffix=" Cr"),
-            margin=dict(l=0, r=0, t=40, b=0)
-        )
-        st.plotly_chart(_fig_t, use_container_width=True)
-
-    # Charts 2 + 3 — YoY comparison and Top expenses (side by side)
-    _c1, _c2 = st.columns(2)
-
-    with _c1:
-        _yoy = get_yoy_comparison(_cur_month)
-        _cy  = _yoy["current"]["month"][:4]
-        _ly  = _yoy["last_year"]["month"][:4]
-        _mo_name = _dt.date(int(_cur_month[:4]), int(_cur_month[5:]), 1).strftime("%B")
-        _fig_y = go.Figure()
-        for _lbl, _cv, _lv, _col in [
-            ("Receipts", _yoy["current"]["receipts"] / 1e7,
-             _yoy["last_year"]["receipts"] / 1e7, "#22C55E"),
-            ("Payouts",  _yoy["current"]["payouts"]  / 1e7,
-             _yoy["last_year"]["payouts"]  / 1e7, "#F87171"),
-        ]:
-            _fig_y.add_trace(go.Bar(
-                name=f"{_lbl} {_cy}", x=[_lbl], y=[_cv],
-                marker_color=_col, opacity=0.9))
-            _fig_y.add_trace(go.Bar(
-                name=f"{_lbl} {_ly}", x=[_lbl], y=[_lv],
-                marker_color=_col, opacity=0.4))
-        _fig_y.update_layout(
-            title=f"YoY — {_mo_name} {_ly} vs {_cy} (₹ Cr)",
-            barmode="group", height=300,
-            plot_bgcolor="#FFFFFF", paper_bgcolor="#FFFFFF",
-            font=dict(family="Inter", size=11),
-            legend=dict(orientation="h", y=1.1),
-            xaxis=dict(showgrid=False),
-            yaxis=dict(showgrid=True, gridcolor="#F0F0F0", ticksuffix=" Cr"),
-            margin=dict(l=0, r=0, t=40, b=0)
-        )
-        st.plotly_chart(_fig_y, use_container_width=True)
-        for _lbl, _cv, _lv in [
-            ("Receipts", _yoy["current"]["receipts"], _yoy["last_year"]["receipts"]),
-            ("Payouts",  _yoy["current"]["payouts"],  _yoy["last_year"]["payouts"]),
-        ]:
-            _chg = ((_cv - _lv) / _lv * 100) if _lv else 0
-            _pcol = "#16A34A" if _chg >= 0 else "#DC2626"
-            _arr  = "▲" if _chg >= 0 else "▼"
-            st.markdown(
-                f'<span style="background:#F5F5F5; padding:3px 10px; '
-                f'border-radius:10px; font-size:12px; margin-right:8px;">'
-                f'{_lbl}: <b style="color:{_pcol};">{_arr} {abs(_chg):.1f}%</b>'
-                f'</span>', unsafe_allow_html=True)
-
-    with _c2:
-        _exp = get_top_expenses_comparison(_cur_month)
-        if _exp["categories"]:
-            _pm = _dt.date(int(_exp["prev_month"][:4]),
-                           int(_exp["prev_month"][5:]), 1).strftime("%b %Y")
-            _cm = _dt.date(int(_exp["current_month"][:4]),
-                           int(_exp["current_month"][5:]), 1).strftime("%b %Y")
-            _fig_e = go.Figure()
-            _fig_e.add_trace(go.Bar(
-                name=_cm, y=_exp["categories"],
-                x=[v / 1e5 for v in _exp["current"]],
-                orientation="h", marker_color="#1B2B4B", opacity=0.85,
-                hovertemplate="%{y}<br>₹%{x:.1f} L<extra>This month</extra>"
-            ))
-            _fig_e.add_trace(go.Bar(
-                name=_pm, y=_exp["categories"],
-                x=[v / 1e5 for v in _exp["previous"]],
-                orientation="h", marker_color="#93C5FD", opacity=0.7,
-                hovertemplate="%{y}<br>₹%{x:.1f} L<extra>Last month</extra>"
-            ))
-            _fig_e.update_layout(
-                title=f"Top Expenses: {_pm} vs {_cm} (₹ L)",
-                barmode="group", height=300,
-                plot_bgcolor="#FFFFFF", paper_bgcolor="#FFFFFF",
-                font=dict(family="Inter", size=11),
-                legend=dict(orientation="h", y=1.1),
-                xaxis=dict(showgrid=True, gridcolor="#F0F0F0", ticksuffix=" L"),
-                yaxis=dict(showgrid=False, categoryorder="total ascending"),
-                margin=dict(l=0, r=80, t=40, b=0)
-            )
-            st.plotly_chart(_fig_e, use_container_width=True)
-
-    # Chart 4 — 12-week net cash flow area chart (full width)
-    _wkp = get_weekly_cash_position(12)
-    if _wkp:
-        _df_wk = pd.DataFrame(_wkp)
-        _df_wk["label"] = _df_wk["week_start"].apply(
-            lambda d: _dt.date.fromisoformat(d).strftime("%d %b") if d else "")
-        _fig_wk = go.Figure()
-        _fig_wk.add_trace(go.Scatter(
-            x=_df_wk["label"],
-            y=_df_wk["net_flow"] / 1e7,
-            mode="lines+markers",
-            fill="tozeroy",
-            line=dict(color="#1B2B4B", width=2),
-            marker=dict(size=5),
-            fillcolor="rgba(27,43,75,0.08)",
-            hovertemplate="Week of %{x}<br>Net ₹%{y:.2f} Cr<extra></extra>"
-        ))
-        _fig_wk.add_hline(y=0, line_dash="dash",
-                          line_color="#E53E3E", line_width=1)
-        _fig_wk.update_layout(
-            title="12-Week Net Cash Flow (₹ Cr)",
-            height=280,
-            plot_bgcolor="#FFFFFF", paper_bgcolor="#FFFFFF",
-            font=dict(family="Inter", size=11),
-            xaxis=dict(showgrid=False),
-            yaxis=dict(showgrid=True, gridcolor="#F0F0F0", ticksuffix=" Cr"),
-            margin=dict(l=0, r=0, t=40, b=0)
-        )
-        st.plotly_chart(_fig_wk, use_container_width=True)
-
-    # ── Monthly trend + category detail (full width) ──────────────────────────
-    render_overview(summary)
+        _, _dw_dl = st.columns([8.5, 1.5])
+        with _dw_dl:
+            st.download_button(
+                "⬇️ Export Excel", _build_daywise_excel(),
+                file_name=f"daywise_total_balance_{_dw[0]['date']}.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                key="dl_daywise_balance", use_container_width=True)
+    else:
+        st.info("No data yet.")
 
 # ══════════════════════════════════════════════════════════════════════════════
 # TRANSACTIONS
@@ -2468,7 +2403,8 @@ elif selected_tab == "Transactions":
                 if _c in ob_show.columns:
                     ob_show[_c] = ob_show[_c].apply(fmt_inr)
             ob_show.columns = [c.replace("_", " ").title() for c in ob_show.columns]
-            st.dataframe(ob_show, use_container_width=True, hide_index=True)
+            st.dataframe(ob_show, use_container_width=True, hide_index=True,
+                         column_config=amount_config(["Debit", "Credit", "Balance"]))
 
         st.markdown("---")
         st.markdown("""
@@ -2594,9 +2530,9 @@ elif selected_tab == "Transactions":
                     "entity":              st.column_config.Column("Entity", width="small"),
                     "bank":                st.column_config.Column("Bank", width="small"),
                     "narration":           st.column_config.Column("Narration", width="large"),
-                    "debit":               st.column_config.Column("Debit ↓", width="medium"),
-                    "credit":              st.column_config.Column("Credit ↑", width="medium"),
-                    "balance":             st.column_config.Column("Balance", width="medium"),
+                    "debit":               rcol("Debit ↓", width="medium"),
+                    "credit":              rcol("Credit ↑", width="medium"),
+                    "balance":             rcol("Balance", width="medium"),
                     "final_group":         st.column_config.Column("Category", width="medium"),
                     "group_name":          st.column_config.Column("Group", width="medium"),
                     "main_group":          st.column_config.Column("Main Group", width="small"),
@@ -2652,6 +2588,7 @@ elif selected_tab == "Transactions":
                     st.warning("⚠️ No rows selected.")
                 else:
                     reverted   = sum(1 for i in selected_ids if revert_manual_category(i))
+                    st.cache_data.clear()
                     no_history = len(selected_ids) - reverted
                     if reverted:
                         st.success(f"↩️ Reverted {reverted} transaction(s) to previous category.")
@@ -2823,7 +2760,7 @@ elif selected_tab == "Exception Report":
             msg = f"No data loaded — {s['last_date']}"
 
         _cb = s.get("closing_bal")
-        _cb_str = (f" · Closing: ₹{fmt_inr(_cb)}" if _cb is not None else "")
+        _cb_str = (f" · Closing: {fmt_inr(_cb)}" if _cb is not None else "")
         st.markdown(f"""
     <div style="background:{bg}; border-left:4px solid {border};
          border-radius:6px; padding:10px 16px; margin:5px 0;
@@ -2974,7 +2911,7 @@ elif selected_tab == "Exception Report":
             f"<td style='padding:5px 8px'>{r['entity']}</td>"
             f"<td style='padding:5px 8px'>{r['bank']}</td>"
             f"<td style='padding:5px 8px;color:var(--red-700,#B91C1C);font-weight:600'>"
-            f"₹{r['debit']:,.0f}</td>"
+            f"{fmt_inr(r['debit'])}</td>"
             f"<td style='padding:5px 8px'>{r['narration'][:50]}</td>"
             f"<td style='padding:5px 8px;color:var(--tx-3,#6B7A90)'>{r['final_group'] or '—'}</td>"
             f"</tr>"
@@ -2982,7 +2919,7 @@ elif selected_tab == "Exception Report":
         ])
         st.markdown(f"""
         <div class="alert-box alert-yellow">
-            <b>🟡 LARGE DEBITS</b> (above ₹{LARGE_DEBIT_THRESHOLD:,.0f})<br><br>
+            <b>🟡 LARGE DEBITS</b> (above {fmt_inr(LARGE_DEBIT_THRESHOLD)})<br><br>
             <table style="width:100%;color:var(--tx-2,#3D4F66);font-size:13px;
                           border-collapse:collapse;font-family:'Inter',sans-serif;">
                 <tr style="color:var(--tx-4,#96A3B4);border-bottom:1px solid var(--border-sm,#E2E7EF);
@@ -3000,7 +2937,7 @@ elif selected_tab == "Exception Report":
     else:
         st.markdown(f"""
         <div class="alert-box alert-green">
-            <b>✅ LARGE DEBITS</b> — No debits above ₹{LARGE_DEBIT_THRESHOLD:,.0f}
+            <b>✅ LARGE DEBITS</b> — No debits above {fmt_inr(LARGE_DEBIT_THRESHOLD)}
         </div>""", unsafe_allow_html=True)
 
     st.markdown("")
@@ -3018,7 +2955,7 @@ elif selected_tab == "Exception Report":
         st.markdown(f"""
         <div class="alert-box alert-green">
             <b>ℹ️ INTERBANK / INTERCOMPANY TRANSFERS</b> — Excluded from P&amp;L<br>
-            {_inter_row["cnt"]:,} transfers totalling ₹{(_inter_row["total"] or 0):,.0f} are excluded
+            {_inter_row["cnt"]:,} transfers totalling {fmt_inr(_inter_row["total"] or 0)} are excluded
             from inflow/outflow calculations.
         </div>""", unsafe_allow_html=True)
 
@@ -3042,6 +2979,7 @@ elif selected_tab == "Exception Report":
 # ══════════════════════════════════════════════════════════════════════════════
 elif selected_tab == "Cash Flow":
     st.markdown(LIVE_BANNER, unsafe_allow_html=True)
+    st.markdown(CF_STYLE, unsafe_allow_html=True)
     # ── Toggle session state ──────────────────────────────────────────────────
     for _k in ["cf_ob_open", "cf_rec_open", "cf_pay_open", "cf_cb_open"]:
         if _k not in st.session_state:
@@ -3065,7 +3003,8 @@ elif selected_tab == "Cash Flow":
     if use_date_range and sel_date_to:
         week_anchor = sel_date_to
     else:
-        week_anchor = datetime.date.today()
+        week_anchor = datetime.date.fromisoformat(
+            get_latest_data_date() or str(datetime.date.today()))
 
     # ── View toggle: Monthly vs Weekly ────────────────────────────────────────
     cf_view = st.radio(
@@ -3083,16 +3022,14 @@ elif selected_tab == "Cash Flow":
             and ("_open" in k or "_grp_" in k)
         ]
 
-    _ea_col, _ca_col = st.columns(2)
+    _ea_col, _ca_col, _ = st.columns([1.7, 1.7, 6.6])
     with _ea_col:
-        if st.button("⊞ Expand All", key="cf_expand_all",
-                     use_container_width=True):
+        if st.button("⊞ Expand All", key="cf_expand_all"):
             for _k in _cf_toggle_keys():
                 st.session_state[_k] = True
             st.rerun()
     with _ca_col:
-        if st.button("⊟ Collapse All", key="cf_collapse_all",
-                     use_container_width=True):
+        if st.button("⊟ Collapse All", key="cf_collapse_all"):
             for _k in _cf_toggle_keys():
                 st.session_state[_k] = False
             st.rerun()
@@ -3151,11 +3088,11 @@ elif selected_tab == "Cash Flow":
     # MONTHLY VIEW
     # ─────────────────────────────────────────────────────────────────────────
     if cf_view == "Monthly":
+        _fmt_d = lambda d: datetime.date.fromisoformat(str(d)).strftime("%d %b %Y")
         st.markdown(f"""
-<div style="background:#1B2B4B; color:#FFFFFF; border-radius:8px;
-     padding:10px 20px; margin:16px 0 8px 0; font-size:13px;
-     font-weight:700; letter-spacing:0.05em;">
-    CASH FLOW STATEMENT · {cf_month_from} to {cf_month_to}
+<div class="cf-stmt-head">
+  <span class="cf-stmt-title">Cash Flow Statement</span>
+  <span class="cf-stmt-range">{_fmt_d(cf_month_from)} &nbsp;→&nbsp; {_fmt_d(cf_month_to)}</span>
 </div>
 """, unsafe_allow_html=True)
         cf = _get_cf(cf_month_from, cf_month_to, financial_year=None)
@@ -3283,29 +3220,35 @@ elif selected_tab == "Cash Flow":
         for _recon_lbl, _recon_key, _recon_color in [
             ("Interbank (Net)",    "interbank_period_net", None),
             ("Intercompany (Net)", "intercompany_period_net", None),
-            ("Investments (Net)",  "investment_net", "#7C3AED"),
         ]:
             _rval = cf.get(_recon_key) or 0
-            _rout = cf.get("investment_outflow") if _recon_key == "investment_net" else None
-            _rin  = cf.get("investment_inflow")  if _recon_key == "investment_net" else None
-            if abs(_rval) > 1 or _rout or _rin:
-                _rcol = _recon_color or ("#16A34A" if _rval >= 0 else "#DC2626")
-                _bg   = "#F5F3FF" if _recon_key == "investment_net" else "#F8FAFF"
+            if abs(_rval) > 1:
+                _rcol = "#166534" if _rval >= 0 else "#B91C1C"
                 _rh1, _rh2, _rh3 = st.columns([0.04, 0.71, 0.25])
                 with _rh2:
-                    st.markdown(
-                        f'<div style="padding:6px 12px; font-size:13px; font-weight:600; '
-                        f'color:{_rcol}; background:{_bg}; border-radius:4px;">'
-                        f'{_recon_lbl}</div>',
-                        unsafe_allow_html=True)
+                    st.markdown(f'<div class="cf-recon-lbl">{_recon_lbl}</div>',
+                                unsafe_allow_html=True)
                 with _rh3:
                     st.markdown(
-                        f'<div style="text-align:right; font-size:13px; color:{_rcol}; '
-                        f'font-weight:600; padding:6px 0;">'
+                        f'<div class="cf-recon-val" style="color:{_rcol};">'
                         f'{fmt_cf(_rval)}</div>',
                         unsafe_allow_html=True)
 
+        # Cash at Stores is a manually entered balance (not a bank movement) — shown as
+        # its own line so Opening + Receipts - Payouts + Cash change = Closing.
         _cb_extra = get_mf_fd_cash_asof(cf_entity, cf_month_to, DATABASE_FILE)
+        _cash_chg = _cb_extra["cash"] - _ob_extra["cash"]
+        if abs(_cash_chg) > 1:
+            _ch1, _ch2, _ch3 = st.columns([0.04, 0.71, 0.25])
+            with _ch2:
+                st.markdown('<div class="cf-recon-lbl">Cash at Stores (Net change)</div>',
+                            unsafe_allow_html=True)
+            with _ch3:
+                st.markdown(
+                    f'<div class="cf-recon-val" style="color:{"#166534" if _cash_chg >= 0 else "#B91C1C"};">'
+                    f'{fmt_cf(_cash_chg)}</div>',
+                    unsafe_allow_html=True)
+
         _closing_combined = (cf["total_closing"] + _cb_extra["mf"]
                              + _cb_extra["fd"] + _cb_extra["cash"])
         _cf_section(
@@ -3319,13 +3262,13 @@ elif selected_tab == "Cash Flow":
             "cf_cb_open", "btn_cf_cb", section_cls="cf-cb", section_bg="#DBEAFE"
         )
 
-        # NET CASH POSITION — new Closing Balance TOTAL minus new Opening Balance TOTAL
+        # NET MOVEMENT — new Closing Balance TOTAL minus new Opening Balance TOTAL
         # (each TOTAL = Bank + Mutual Fund + Fixed Deposit + Cash at Stores)
         _net     = _closing_combined - _opening_combined
         _net_cls = "pos" if _net >= 0 else "neg"
         st.markdown(f"""
 <div class="cf-net {_net_cls}">
-  <span>NET CASH POSITION</span>
+  <span>NET MOVEMENT</span>
   <span>{_inr(_net)}</span>
 </div>""", unsafe_allow_html=True)
 
@@ -3353,7 +3296,7 @@ elif selected_tab == "Cash Flow":
 </div>""", unsafe_allow_html=True)
 
         # Excel export
-        _, _ec2, _ = st.columns([6, 1.5, 0.5])
+        _, _ec2 = st.columns([8.5, 1.5])
         with _ec2:
             def _build_excel_monthly():
                 from openpyxl import Workbook
@@ -3412,8 +3355,8 @@ elif selected_tab == "Cash Flow":
                 for k, v in payouts_ordered.items():
                     _xlr(k, v, indent=1)
                 _xlr("Total Payouts", cf["total_payouts"], style="total")
-                if cf.get("investment_net") or cf.get("investment_inflow") or cf.get("investment_outflow"):
-                    _xlr("Investments (Net)", cf["investment_net"], style="header")
+                if abs(_cash_chg) > 1:
+                    _xlr("Cash at Stores (Net change)", _cash_chg, style="header")
                 _xlr("Closing Balance", style="header")
                 for k, v in cf["closing_balances"].items():
                     _xlr(f"Bank ({k})", v, indent=1)
@@ -3421,7 +3364,7 @@ elif selected_tab == "Cash Flow":
                 _xlr("Fixed Deposit Balance", _cb_extra["fd"], indent=1)
                 _xlr("Cash at Stores", _cb_extra["cash"], indent=1)
                 _xlr("Total Closing Balance", _closing_combined, style="total")
-                _xlr("Net Cash Position", _net, style="net")
+                _xlr("Net Movement", _net, style="net")
                 out = io.BytesIO()
                 wb.save(out)
                 return out.getvalue()
@@ -3565,15 +3508,15 @@ elif selected_tab == "Cash Flow":
         _wk_cls = ["std", "std", "std", "std"]  # uniform week column headers
 
         # ── Colour palette ────────────────────────────────────────────────
-        _WK_BG  = ["#F0F7FF", "#FFFFFF", "#F0F7FF", "#FFFFFF"]  # W1-W4 alternating
-        _TOT_BG = "#EFF6FF"
+        _WK_BG  = ["#F8FAFC", "#FFFFFF", "#F8FAFC", "#FFFFFF"]  # W1-W4 alternating
+        _TOT_BG = "#EAF0FA"
         _SEC = {
-            "opening":  {"bg": "#DBEAFE", "text": "#1E40AF"},
-            "receipts": {"bg": "#EDE9FE", "text": "#5B21B6"},
-            "payouts":  {"bg": "#FCE7F3", "text": "#9D174D"},
-            "closing":  {"bg": "#DBEAFE", "text": "#1E40AF"},
-            "net_pos":  {"bg": "#F0FDF4", "text": "#14532D"},
-            "net_neg":  {"bg": "#FFF1F2", "text": "#9D174D"},
+            "opening":  {"bg": "#EAF0FA", "text": "#1B2B4B"},
+            "receipts": {"bg": "#ECFDF3", "text": "#166534"},
+            "payouts":  {"bg": "#FEF0F0", "text": "#991B1B"},
+            "closing":  {"bg": "#EAF0FA", "text": "#1B2B4B"},
+            "net_pos":  {"bg": "#ECFDF3", "text": "#166534"},
+            "net_neg":  {"bg": "#FEF0F0", "text": "#991B1B"},
         }
 
         # ── Column header row ─────────────────────────────────────────────
@@ -3842,41 +3785,53 @@ elif selected_tab == "Cash Flow":
             unsafe_allow_html=True)
 
         # ── Reconciling lines: Interbank / Intercompany / Investment net per week ─
-        _WK_RECON_BG = ["#F0F7FF", "#FFFFFF", "#F0F7FF", "#FFFFFF"]
+        _WK_RECON_BG = ["#F6F8FB", "#FFFFFF", "#F6F8FB", "#FFFFFF"]
         for _recon_lbl, _recon_key, _recon_color in [
             ("Interbank (Net)",    "interbank_period_net", None),
             ("Intercompany (Net)", "intercompany_period_net", None),
-            ("Investments (Net)",  "investment_net", "#7C3AED"),
         ]:
             _week_vals   = [_wd.get(_recon_key) or 0 for _wd in _w_data]
-            _week_has_inv = any(_wd.get("investment_inflow") or _wd.get("investment_outflow") for _wd in _w_data)
             _grand_total = sum(_week_vals)
-            if any(abs(_v) > 1 for _v in _week_vals) or (_recon_key == "investment_net" and _week_has_inv):
+            if any(abs(_v) > 1 for _v in _week_vals):
                 _rr = st.columns(CF_COLS)
                 with _rr[1]:
-                    _rc = _recon_color or ("#16A34A" if _grand_total >= 0 else "#DC2626")
-                    _rbg = "#F5F3FF" if _recon_key == "investment_net" else "#F8FAFF"
-                    st.markdown(
-                        f'<div style="padding:6px 12px; font-size:13px; font-weight:600; '
-                        f'color:{_rc}; background:{_rbg}; border-radius:4px;">'
-                        f'{_recon_lbl}</div>',
-                        unsafe_allow_html=True)
+                    st.markdown(f'<div class="cf-recon-lbl">{_recon_lbl}</div>',
+                                unsafe_allow_html=True)
                 for _i, _v in enumerate(_week_vals):
                     with _rr[_i + 2]:
-                        _vc = "#16A34A" if _v >= 0 else "#DC2626"
+                        _vc = "#166534" if _v >= 0 else "#B91C1C"
                         _vd = fmt_cf(_v) if abs(_v) > 1 else "—"
                         st.markdown(
-                            f'<div style="text-align:right; font-size:12px; color:{_vc}; '
-                            f'font-weight:600; background:{_WK_RECON_BG[_i]}; padding:6px;">'
-                            f'{_vd}</div>',
+                            f'<div class="cf-recon-val" style="color:{_vc}; border-radius:0; '
+                            f'background:{_WK_RECON_BG[_i]};">{_vd}</div>',
                             unsafe_allow_html=True)
                 with _rr[6]:
-                    _tc = "#16A34A" if _grand_total >= 0 else "#DC2626"
+                    _tc = "#166534" if _grand_total >= 0 else "#B91C1C"
                     st.markdown(
-                        f'<div style="text-align:right; font-size:12px; color:{_tc}; '
-                        f'font-weight:700; background:#F0F4FF; padding:6px;">'
-                        f'{fmt_cf(_grand_total)}</div>',
+                        f'<div class="cf-recon-val" style="color:{_tc}; font-weight:700; '
+                        f'background:#EAF0FA;">{fmt_cf(_grand_total)}</div>',
                         unsafe_allow_html=True)
+
+        # ── Cash at Stores (Net change) per week ─────────────────────────
+        _wk_cash_chg = [_mfc_close[_wi]["cash"] - _mfc_open[_wi]["cash"] for _wi in range(4)]
+        if any(abs(_v) > 1 for _v in _wk_cash_chg):
+            _cr_ = st.columns(CF_COLS)
+            with _cr_[1]:
+                st.markdown('<div class="cf-recon-lbl">Cash at Stores (Net change)</div>',
+                            unsafe_allow_html=True)
+            for _i, _v in enumerate(_wk_cash_chg):
+                with _cr_[_i + 2]:
+                    _vc = "#166534" if _v >= 0 else "#B91C1C"
+                    st.markdown(
+                        f'<div class="cf-recon-val" style="color:{_vc}; border-radius:0; '
+                        f'background:{_WK_RECON_BG[_i]};">{fmt_cf(_v) if abs(_v) > 1 else "—"}</div>',
+                        unsafe_allow_html=True)
+            with _cr_[6]:
+                _tcc = sum(_wk_cash_chg)
+                st.markdown(
+                    f'<div class="cf-recon-val" style="color:{"#166534" if _tcc >= 0 else "#B91C1C"}; '
+                    f'font-weight:700; background:#EAF0FA;">{fmt_cf(_tcc)}</div>',
+                    unsafe_allow_html=True)
 
         # ── Closing Balance ───────────────────────────────────────────────
         _cb_r = st.columns(CF_COLS)
@@ -3943,13 +3898,13 @@ elif selected_tab == "Cash Flow":
             '<hr class="cf-divider-sm">',
             unsafe_allow_html=True)
 
-        # ── Net Cash Position per week — always visible ───────────────────
+        # ── Net Movement per week — always visible ───────────────────
         _wnet_r = st.columns(CF_COLS)
         with _wnet_r[1]:
             st.markdown(
-                '<div class="cf-wk-net-label">NET CASH POSITION</div>',
+                '<div class="cf-wk-net-label">NET MOVEMENT</div>',
                 unsafe_allow_html=True)
-        # NET CASH POSITION = new Closing Balance TOTAL minus new Opening Balance
+        # NET MOVEMENT = new Closing Balance TOTAL minus new Opening Balance
         # TOTAL, per week (each TOTAL = Bank + Mutual Fund + Fixed Deposit + Cash).
         _wnet_vals  = [_cb_combined[_wi] - _ob_combined[_wi] for _wi in range(4)]
         _total_wnet = sum(_wnet_vals)
@@ -3980,7 +3935,7 @@ elif selected_tab == "Cash Flow":
             _tdif = _w_data[_wi]["tally_diff"]
             _tok  = abs(_tdif) <= 1
             _tic  = "✅" if _tok else "⚠️"
-            _tip  = "Tallied" if _tok else fmt_cf(abs(_tdif))
+            _tip  = "Tallied" if _tok else fmt_inr(abs(_tdif))
             _tbg_t = "var(--green-50,#F0FDF4)" if _tok else "var(--amber-50,#FFFBEB)"
             with _tally_r[_wi + 2]:
                 st.markdown(
@@ -3990,7 +3945,7 @@ elif selected_tab == "Cash Flow":
         _total_tdif = round(_cb_combined[3] - _db_combined_close[3], 2)
         with _tally_r[6]:
             _gt_ok  = abs(_total_tdif) <= 1
-            _gt_tip = "Tallied" if _gt_ok else fmt_cf(abs(_total_tdif))
+            _gt_tip = "Tallied" if _gt_ok else fmt_inr(abs(_total_tdif))
             _gt_bg  = "var(--green-50,#F0FDF4)" if _gt_ok else "var(--amber-50,#FFFBEB)"
             st.markdown(
                 f'<div style="text-align:center;padding:3px 2px;background:{_gt_bg};'
@@ -4089,153 +4044,132 @@ elif selected_tab == "Investments":
                         except AttributeError:
                             st.experimental_rerun()
 
-    # ── Cash at Stores — date-aware entry (Entity-selectable) ────────────────
-    st.markdown("#### 💵 Cash at Stores")
-
-    cash_cols = st.columns([1, 1.3, 1, 1, 1])
-
-    with cash_cols[0]:
-        cash_entity_pick = st.selectbox(
-            "Entity", ["Stores", "Ventures"], key="cash_entity_pick"
-        )
-
-    with cash_cols[1]:
-        entry_date_pick = st.date_input(
-            "Date", value=_today,
-            key="cash_entry_date", format="DD/MM/YYYY"
-        )
-
-    current_val = get_cash_asof(cash_entity_pick, str(entry_date_pick))
-
-    with cash_cols[2]:
-        st.markdown(f"""
-    <div style="background:#FFFFFF; border-radius:10px;
-         padding:12px 16px; border:1px solid #E8ECF0;
-         border-top:3px solid #1B2B4B;">
-        <div style="font-size:10px; font-weight:700; color:#8896A5;
-             text-transform:uppercase; margin-bottom:4px;">
-            {cash_entity_pick.upper()} · {entry_date_pick.strftime('%d %b %Y')}</div>
-        <div style="font-size:18px; font-weight:700; color:#1B2B4B;">
-            {fmt_inr(current_val)}</div>
-    </div>
-    """, unsafe_allow_html=True)
-
-    with cash_cols[3]:
-        new_cash = st.number_input(
-            "New Value (₹)", min_value=0.0, step=10000.0,
-            value=float(current_val or 0), key="cash_input_v2"
-        )
-
-    with cash_cols[4]:
-        st.markdown("<br>", unsafe_allow_html=True)
-        if st.button("💾 Save", key="save_cash_v2"):
-            set_cash_entry(cash_entity_pick, str(entry_date_pick), new_cash)
-            st.success(
-                f"✅ {cash_entity_pick} cash for {entry_date_pick.strftime('%d %b %Y')} "
-                f"set to {fmt_inr(new_cash)}")
-            st.cache_data.clear()
-            st.rerun()
-
-    st.markdown("<br>", unsafe_allow_html=True)
-
-    # ── B4: Investment Portfolio — movements from actual transactions ─────────
-    st.markdown('<div class="section-header" style="margin-bottom:10px;">Investment Portfolio</div>',
+    # ── Scheme-wise balances (FD and MF separately) ──────────────────────────
+    st.markdown('<div class="section-header" style="margin-bottom:10px;">Investment Portfolio — Scheme-wise Balance</div>',
                 unsafe_allow_html=True)
 
-    inv_movements  = get_investment_movements(
-        entity=entity_filter,
-        date_from=inv_date_from,
-        date_to=inv_date_to,
-    )
-    inv_register   = get_investment_register()
-    manual_totals  = get_manual_investment_totals()
-    register_map   = {r["scheme_name"]: r for r in inv_register}
+    _inv_asof = str(sel_date_to) if (use_date_range and sel_date_to) else None
+    _ev_all = pd.DataFrame(get_investment_events(entity_filter))
+    if _ev_all.empty:
+        st.info("No investment data found.")
+    else:
+        _ev_all["scheme_key"] = (_ev_all["scheme_type"] + "||" + _ev_all["scheme_name"]
+                                 + "||" + _ev_all["entity"])
+        _ev_asof = _ev_all[_ev_all["date"].isna()
+                           | (_ev_all["date"] <= (_inv_asof or "9999-12-31"))]
+        st.caption(f"Balance as on {_inv_asof or 'latest'} — Opening + Invested − Redeemed. "
+                   "Bank-tagged and manual entries are combined per scheme. "
+                   "Untagged bank investment transactions are listed under FD as 'Untagged'.")
 
-    _rows_display = []
-    _seen_schemes = set()
-
-    # Rows from bank transactions tagged with main_group=INVESTMENT
-    for _mov in inv_movements:
-        _sn = _mov["scheme_name"]
-        _seen_schemes.add(_sn)
-        _reg     = register_map.get(_sn, {})
-        _opening = _reg.get("opening_value", 0) or 0
-        _current = _opening + (_mov["invested"] or 0) - (_mov["redeemed"] or 0)
-        _rows_display.append({
-            "Scheme":        _sn,
-            "Number":        _mov["scheme_number"],
-            "Type":          _mov["scheme_type"],
-            "Entity":        _mov["entity"],
-            "Source":        "Bank Txn",
-            "Opening (₹)":  fmt_inr(_opening),
-            "Invested (₹)": fmt_inr(_mov["invested"]) if _mov["invested"] else "—",
-            "Redeemed (₹)": fmt_inr(_mov["redeemed"]) if _mov["redeemed"] else "—",
-            "Current (₹)":  fmt_inr(_current),
-            "Txns":          _mov["txn_count"],
-        })
-
-    # Rows from manual entries (off-statement FD/MF)
-    for _mt in manual_totals:
-        _sn = _mt["scheme_name"]
-        _seen_schemes.add(_sn)
-        _reg      = register_map.get(_sn, {})
-        _opening  = _reg.get("opening_value", 0) or 0
-        _invested = _mt["invested"]  or 0
-        _redeemed = _mt["redeemed"]  or 0
-        _current  = _opening + _invested - _redeemed
-        _rows_display.append({
-            "Scheme":        _sn,
-            "Number":        "—",
-            "Type":          _mt["scheme_type"],
-            "Entity":        _mt["entity"],
-            "Source":        "Manual",
-            "Opening (₹)":  fmt_inr(_opening),
-            "Invested (₹)": fmt_inr(_invested) if _invested else "—",
-            "Redeemed (₹)": fmt_inr(_redeemed) if _redeemed else "—",
-            "Current (₹)":  fmt_inr(_current),
-            "Txns":          _mt["entry_count"],
-        })
-
-    # Static register entries with no transactions and no manual entries
-    for _r in inv_register:
-        if _r["scheme_name"] not in _seen_schemes:
-            _rows_display.append({
-                "Scheme":        _r["scheme_name"],
-                "Number":        "—",
-                "Type":          _r["scheme_type"],
-                "Entity":        _r["entity"],
-                "Source":        "Register",
-                "Opening (₹)":  fmt_inr(_r["opening_value"] or 0),
-                "Invested (₹)": "—",
-                "Redeemed (₹)": "—",
-                "Current (₹)":  fmt_inr(_r["opening_value"] or 0),
-                "Txns":          0,
+        _rows_by_type = {"FD": [], "MF": []}
+        for (_stype, _sname, _sent), _g in _ev_asof.groupby(
+                ["scheme_type", "scheme_name", "entity"]):
+            if _stype not in _rows_by_type:
+                continue
+            _op  = _g.loc[_g["source"] == "Opening", "delta"].sum()
+            _mv  = _g[_g["source"] != "Opening"]
+            _inv = _mv.loc[_mv["delta"] > 0, "delta"].sum()
+            _red = -_mv.loc[_mv["delta"] < 0, "delta"].sum()
+            _rows_by_type[_stype].append({
+                "Scheme": _sname, "Entity": _sent,
+                "Opening (₹)": _op, "Invested (₹)": _inv,
+                "Redeemed (₹)": _red, "Balance (₹)": _op + _inv - _red,
             })
 
-    if _rows_display:
-        _df_inv_portfolio = pd.DataFrame(_rows_display)
-        st.dataframe(_df_inv_portfolio, use_container_width=True, hide_index=True)
-
-        # Total row
-        _total_current = 0.0
-        for _row in _rows_display:
-            _cv = _row.get("Current (₹)", "")
-            if _cv and _cv not in ("—", ""):
-                try:
-                    _total_current += float(
-                        str(_cv).replace("₹", "").replace(",", "").strip()
-                    )
-                except Exception:
-                    pass
-        st.markdown(f"""
+        for _stype, _title in (("FD", "Fixed Deposits"), ("MF", "Mutual Funds")):
+            st.markdown(f"##### {_title}")
+            _rws = _rows_by_type[_stype]
+            if not _rws:
+                st.info(f"No {_title} found.")
+                continue
+            _dfp = pd.DataFrame(_rws).sort_values("Balance (₹)", ascending=False)
+            _tot = _dfp["Balance (₹)"].sum()
+            _show = _dfp.copy()
+            for _c in ["Opening (₹)", "Invested (₹)", "Redeemed (₹)", "Balance (₹)"]:
+                _show[_c] = _show[_c].apply(fmt_inr)
+            st.dataframe(_show, use_container_width=True, hide_index=True,
+                         column_config=amount_config(
+                             ["Opening (₹)", "Invested (₹)", "Redeemed (₹)", "Balance (₹)"]))
+            st.markdown(f"""
 <div style="background:#1B2B4B;color:#FFFFFF;border-radius:8px;
-     padding:12px 20px;display:flex;justify-content:space-between;
-     margin-top:8px;">
-    <b>TOTAL INVESTMENT VALUE</b>
-    <b>{fmt_inr(_total_current)}</b>
+     padding:10px 20px;display:flex;justify-content:space-between;margin:4px 0 14px;">
+    <b>TOTAL {_title.upper()}</b><b>{fmt_inr(_tot)}</b>
 </div>""", unsafe_allow_html=True)
-    else:
-        st.info("No investment data found.")
+
+        # ── Day-wise running balance ─────────────────────────────────────────
+        st.markdown('<div class="section-header" style="margin:18px 0 10px;">Day-wise Investment Value</div>',
+                    unsafe_allow_html=True)
+        st.caption("Running balance (Opening + cumulative Invested − Redeemed) on each date that had a "
+                   "movement. Select a row to see the scheme-wise split for that date.")
+        _dated = _ev_all[_ev_all["date"].notna()]
+        if _dated.empty:
+            st.info("No dated investment movements yet.")
+        else:
+            _base = _ev_all[_ev_all["date"].isna()].groupby("scheme_key")["delta"].sum()
+            _piv = (_dated.groupby(["date", "scheme_key"])["delta"].sum()
+                    .unstack(fill_value=0).sort_index())
+            _piv = _piv.reindex(columns=sorted(set(_piv.columns) | set(_base.index)), fill_value=0)
+            _cum = _piv.cumsum().add(_base.reindex(_piv.columns, fill_value=0), axis=1)
+            _is_fd = [k.split("||")[0] == "FD" for k in _cum.columns]
+            _is_mf = [k.split("||")[0] == "MF" for k in _cum.columns]
+            _daily = pd.DataFrame({
+                "Date": _cum.index,
+                "FD Balance": _cum.loc[:, _is_fd].sum(axis=1).values,
+                "MF Balance": _cum.loc[:, _is_mf].sum(axis=1).values,
+            })
+            _daily["Total"] = _daily["FD Balance"] + _daily["MF Balance"]
+
+            if use_date_range and sel_date_from and sel_date_to:
+                _daily = _daily[(_daily["Date"] >= str(sel_date_from))
+                                & (_daily["Date"] <= str(sel_date_to))]
+            _daily = _daily.sort_values("Date", ascending=False).reset_index(drop=True)
+
+            if _daily.empty:
+                st.info("No investment movements in the selected date range.")
+            else:
+                _fig_d = go.Figure()
+                _dchart = _daily.sort_values("Date")
+                for _col, _clr in (("FD Balance", "#1B2B4B"), ("MF Balance", "#7C3AED")):
+                    _fig_d.add_trace(go.Scatter(
+                        x=_dchart["Date"], y=_dchart[_col] / 1e7, name=_col,
+                        mode="lines+markers", line=dict(color=_clr, width=2, shape="hv"),
+                        hovertemplate="%{x}<br>₹%{y:.2f} Cr<extra>" + _col + "</extra>"))
+                _fig_d.update_layout(
+                    height=280, plot_bgcolor="#FFFFFF", paper_bgcolor="#FFFFFF",
+                    font=dict(family="Inter", size=11), legend=dict(orientation="h", y=1.12),
+                    xaxis=dict(showgrid=False),
+                    yaxis=dict(showgrid=True, gridcolor="#F0F0F0", ticksuffix=" Cr"),
+                    margin=dict(l=0, r=0, t=30, b=0))
+                st.plotly_chart(_fig_d, use_container_width=True)
+
+                _dshow = _daily.copy()
+                for _c in ["FD Balance", "MF Balance", "Total"]:
+                    _dshow[_c] = _dshow[_c].apply(fmt_inr)
+                _sel = st.dataframe(
+                    _dshow, use_container_width=True, hide_index=True, height=300,
+                    column_config=amount_config(["FD Balance", "MF Balance", "Total"]),
+                    on_select="rerun", selection_mode="single-row", key="inv_daily_sel")
+
+                if _sel.selection.rows:
+                    _d_pick = _daily.iloc[_sel.selection.rows[0]]["Date"]
+                    _day_mv = _piv.loc[_d_pick]
+                    _det = []
+                    for _k in _cum.columns:
+                        _stype, _sname, _sent = _k.split("||")
+                        _bal = _cum.loc[_d_pick, _k]
+                        if _bal == 0 and _day_mv[_k] == 0:
+                            continue
+                        _det.append({"Type": _stype, "Scheme": _sname, "Entity": _sent,
+                                     "Movement on day (₹)": fmt_inr(_day_mv[_k]),
+                                     "Balance (₹)": fmt_inr(_bal)})
+                    st.markdown(f"##### Scheme-wise balance on {_d_pick}")
+                    if _det:
+                        st.dataframe(pd.DataFrame(_det).sort_values(["Type", "Scheme"]),
+                                     use_container_width=True, hide_index=True,
+                                     column_config=amount_config(
+                                         ["Movement on day (₹)", "Balance (₹)"]))
+                    else:
+                        st.info("No scheme balances on this date.")
 
     st.markdown("<br>", unsafe_allow_html=True)
 
@@ -4277,6 +4211,7 @@ elif selected_tab == "Investments":
                     update_investment_opening(
                         _scheme["scheme_name"], _new_val,
                         "2026-04-01", _new_ent)
+                    st.cache_data.clear()
                     st.success(f"Saved {_scheme['scheme_name']}")
                     st.rerun()
 
@@ -4303,6 +4238,7 @@ elif selected_tab == "Investments":
                     add_investment_scheme(
                         _new_name.strip(), _new_type,
                         _new_ent2, _new_opening, "2026-04-01")
+                    st.cache_data.clear()
                     st.success(f"Added {_new_name}")
                     st.rerun()
                 else:
@@ -4320,6 +4256,7 @@ elif selected_tab == "Investments":
             st.markdown("<br>", unsafe_allow_html=True)
             if st.button("🗑️ Remove", key="del_scheme_btn"):
                 delete_investment_scheme(_del_scheme)
+                st.cache_data.clear()
                 st.success(f"Removed {_del_scheme}")
                 st.rerun()
 
@@ -4427,6 +4364,55 @@ elif selected_tab == "Investments":
     </div>
 </div>""", unsafe_allow_html=True)
 
+    # ── Cash at Stores — date-aware entry (Entity-selectable) ────────────────
+    st.markdown("#### 💵 Cash at Stores")
+
+    cash_cols = st.columns([1, 1.3, 1, 1, 1])
+
+    with cash_cols[0]:
+        cash_entity_pick = st.selectbox(
+            "Entity", ["Stores", "Ventures"], key="cash_entity_pick"
+        )
+
+    with cash_cols[1]:
+        entry_date_pick = st.date_input(
+            "Date", value=_today,
+            key="cash_entry_date", format="DD/MM/YYYY"
+        )
+
+    current_val = get_cash_asof(cash_entity_pick, str(entry_date_pick))
+
+    with cash_cols[2]:
+        st.markdown(f"""
+    <div style="background:#FFFFFF; border-radius:10px;
+         padding:12px 16px; border:1px solid #E8ECF0;
+         border-top:3px solid #1B2B4B;">
+        <div style="font-size:10px; font-weight:700; color:#8896A5;
+             text-transform:uppercase; margin-bottom:4px;">
+            {cash_entity_pick.upper()} · {entry_date_pick.strftime('%d %b %Y')}</div>
+        <div style="font-size:18px; font-weight:700; color:#1B2B4B;">
+            {fmt_inr(current_val)}</div>
+    </div>
+    """, unsafe_allow_html=True)
+
+    with cash_cols[3]:
+        new_cash = st.number_input(
+            "New Value (₹)", min_value=0.0, step=10000.0,
+            value=float(current_val or 0), key="cash_input_v2"
+        )
+
+    with cash_cols[4]:
+        st.markdown("<br>", unsafe_allow_html=True)
+        if st.button("💾 Save", key="save_cash_v2"):
+            set_cash_entry(cash_entity_pick, str(entry_date_pick), new_cash)
+            st.success(
+                f"✅ {cash_entity_pick} cash for {entry_date_pick.strftime('%d %b %Y')} "
+                f"set to {fmt_inr(new_cash)}")
+            st.cache_data.clear()
+            st.rerun()
+
+    st.markdown("<br>", unsafe_allow_html=True)
+
     # ── Cash at Stores — audit trail (entity-filterable) ─────────────────────
     st.markdown("##### 📋 Cash at Stores — History")
 
@@ -4515,6 +4501,8 @@ elif selected_tab == "Investments":
                 "scheme_number": st.column_config.Column("Scheme No.", width="medium"),
                 "scheme_type":   st.column_config.SelectboxColumn(
                     "Type", options=["FD", "MF", ""], width="small"),
+                "debit":         rcol("Debit"),
+                "credit":        rcol("Credit"),
             },
             disabled=["id", "date", "entity", "bank", "narration",
                       "debit", "credit", "final_group"],

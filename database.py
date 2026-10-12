@@ -2,7 +2,6 @@ import sqlite3
 import hashlib
 import os
 import datetime
-import functools
 from config import DATABASE_FILE
 
 
@@ -355,8 +354,11 @@ def insert_transactions(rows):
                 row.get("upload_id"),
             ))
             inserted += 1
-        except Exception:
+        except sqlite3.IntegrityError:
+            skipped += 1   # duplicate fingerprint — expected
+        except Exception as exc:
             skipped += 1
+            print(f"[DB] ERROR inserting row ({row.get('bank')} {row.get('date')}): {exc}")
 
     conn.commit()
     conn.close()
@@ -908,7 +910,8 @@ def get_available_months(financial_year=None):
     return [r["month"] for r in rows if r["month"]]
 
 
-def get_transaction_count(entity=None, bank=None, month=None, financial_year=None):
+def get_transaction_count(entity=None, bank=None, month=None, financial_year=None,
+                          date_from=None, date_to=None):
     """Count only — never loads rows into memory."""
     conn   = get_connection()
     query  = "SELECT COUNT(*) as cnt FROM transactions WHERE final_group != 'OPENING BALANCE'"
@@ -917,7 +920,9 @@ def get_transaction_count(entity=None, bank=None, month=None, financial_year=Non
         query += " AND entity=?"; params.append(entity)
     if bank and bank != "All":
         query += " AND bank=?"; params.append(bank)
-    if month and month != "All":
+    if date_from and date_to:
+        query += " AND date >= ? AND date <= ?"; params.extend([str(date_from), str(date_to)])
+    elif month and month != "All":
         query += " AND strftime('%Y-%m', date)=?"; params.append(month)
     if financial_year and financial_year != "All":
         query += " AND financial_year=?"; params.append(financial_year)
@@ -1421,6 +1426,53 @@ def get_investment_movements(entity=None, date_from=None, date_to=None):
     return [dict(r) for r in rows]
 
 
+def get_investment_events(entity=None):
+    """
+    Every investment balance movement, all sources, as one flat list.
+    Each row: date, scheme_name, scheme_type ('FD'/'MF'), entity, delta, source.
+    delta > 0 = invested (balance up), delta < 0 = redeemed (balance down).
+    Register opening values are emitted with date=None (present from the start).
+    Untagged bank INVESTMENT transactions are returned as scheme 'Untagged', type 'FD'
+    (consistent with the Cash Flow tab, which derives FD = combined - MF).
+    """
+    conn = get_connection()
+    ent_sql, ent_p = "", []
+    if entity and entity != "All":
+        ent_sql, ent_p = " AND entity=?", [entity]
+
+    events = []
+    for r in conn.execute(
+            f"SELECT scheme_name, scheme_type, entity, opening_value "
+            f"FROM investment_register WHERE 1=1{ent_sql}", ent_p).fetchall():
+        events.append({"date": None, "scheme_name": r["scheme_name"],
+                       "scheme_type": r["scheme_type"], "entity": r["entity"],
+                       "delta": r["opening_value"] or 0, "source": "Opening"})
+
+    for r in conn.execute(f"""
+        SELECT t.date, t.entity, t.debit, t.credit,
+               COALESCE(NULLIF(m.scheme_name,''), 'Untagged') AS scheme_name,
+               COALESCE(NULLIF(m.scheme_type,''), 'FD')       AS scheme_type
+        FROM transactions t
+        LEFT JOIN investment_txn_mapping m ON t.id = m.transaction_id
+        WHERE UPPER(t.main_group)='INVESTMENT'{ent_sql.replace('entity', 't.entity')}
+    """, ent_p).fetchall():
+        delta = (r["debit"] or 0) - (r["credit"] or 0)
+        if delta:
+            events.append({"date": r["date"], "scheme_name": r["scheme_name"],
+                           "scheme_type": r["scheme_type"], "entity": r["entity"],
+                           "delta": delta, "source": "Bank Txn"})
+
+    for r in conn.execute(
+            f"SELECT entry_date, scheme_name, scheme_type, entity, amount, entry_type "
+            f"FROM manual_investments WHERE 1=1{ent_sql}", ent_p).fetchall():
+        sign = 1 if r["entry_type"] == "Invested" else -1
+        events.append({"date": r["entry_date"], "scheme_name": r["scheme_name"],
+                       "scheme_type": r["scheme_type"], "entity": r["entity"],
+                       "delta": sign * (r["amount"] or 0), "source": "Manual"})
+    conn.close()
+    return events
+
+
 def get_investment_summary(entity=None, date_from=None, date_to=None):
     """
     Returns full investment portfolio summary:
@@ -1429,9 +1481,17 @@ def get_investment_summary(entity=None, date_from=None, date_to=None):
     - Current value = opening + invested - redeemed
     """
     schemes  = get_investment_register()
-    txn_data = get_investment_transactions(
+    # Per-scheme invested/redeemed come from get_investment_movements(); the
+    # row-level get_investment_transactions() has no such totals.
+    txn_data = get_investment_movements(
         entity=entity, date_from=date_from, date_to=date_to)
-    txn_map  = {r["scheme_name"]: r for r in txn_data}
+    txn_map  = {}
+    for r in txn_data:
+        agg = txn_map.setdefault(r["scheme_name"],
+                                 {"total_invested": 0, "total_redeemed": 0, "txn_count": 0})
+        agg["total_invested"] += r["invested"] or 0
+        agg["total_redeemed"] += r["redeemed"] or 0
+        agg["txn_count"]      += r["txn_count"] or 0
 
     results = []
     for scheme in schemes:
@@ -1824,7 +1884,6 @@ def import_cash_excel(filepath):
              "errors": errors, "error_rows": error_rows}
 
 
-@functools.lru_cache(maxsize=32)
 def get_tab_summary_cached(entity, bank, month, financial_year):
     """
     Lightweight summary for header band only.
@@ -2236,6 +2295,79 @@ def get_latest_data_date():
     """).fetchone()
     conn.close()
     return row["latest"] if row and row["latest"] else None
+
+
+def get_daywise_totals():
+    """
+    Day-by-day total balance for EVERY calendar day from the first transaction
+    to the latest data date. Always all entities / all banks (no filters).
+
+    Each row: date, bank, fd, mf, cash, total — the same components and the same
+    as-on carry-forward rules as the header banner (get_entity_bank_balance_asof,
+    get_entity_investment_asof, get_investment_mf_asof, get_cash_asof), so the
+    last row equals the banner's Total Cash Position.
+    Returns a list of dicts, newest date first.
+    """
+    import pandas as pd
+
+    conn = get_connection()
+    tx = pd.read_sql_query(
+        "SELECT entity, bank, date, balance FROM transactions "
+        "WHERE final_group != 'OPENING BALANCE' AND balance IS NOT NULL "
+        "ORDER BY date, id", conn)
+    pairs = [(r["entity"], r["bank"]) for r in conn.execute(
+        "SELECT DISTINCT entity, bank FROM transactions").fetchall()]
+    ob = {}
+    for r in conn.execute(
+            "SELECT entity, bank, balance FROM transactions "
+            "WHERE final_group='OPENING BALANCE' ORDER BY date").fetchall():
+        if r["balance"] is not None:
+            ob[(r["entity"], r["bank"])] = r["balance"]
+    cash_rows = pd.read_sql_query(
+        "SELECT entity, entry_date, value FROM cash_register_v2 ORDER BY entry_date", conn)
+    conn.close()
+
+    latest = get_latest_data_date()
+    if tx.empty or not latest:
+        return []
+    days = pd.date_range(tx["date"].min(), latest, freq="D")
+    tx["date"] = pd.to_datetime(tx["date"])
+
+    # ── Bank: last balance on or before each day, per (entity, bank) ──────────
+    bank_total = pd.Series(0.0, index=days)
+    for pair in pairs:
+        sub = tx[(tx["entity"] == pair[0]) & (tx["bank"] == pair[1])]
+        s = sub.groupby("date")["balance"].last()
+        s = s.reindex(s.index.union(days)).ffill().reindex(days)
+        bank_total += s.fillna(ob.get(pair, 0.0))
+
+    # ── FD / MF: opening + cumulative movements up to each day ────────────────
+    ev = pd.DataFrame(get_investment_events(None))
+    fd = pd.Series(0.0, index=days)
+    mf = pd.Series(0.0, index=days)
+    if not ev.empty:
+        for stype, target in (("MF", mf), ("FD", fd)):
+            e = ev[ev["scheme_type"] == stype] if stype == "MF" else ev[ev["scheme_type"] != "MF"]
+            opening = e.loc[e["date"].isna(), "delta"].sum()
+            d = e[e["date"].notna()].copy()
+            d["date"] = pd.to_datetime(d["date"])
+            mv = d.groupby("date")["delta"].sum()
+            cum = mv.reindex(mv.index.union(days)).fillna(0).cumsum().reindex(days)
+            target += opening + cum.fillna(0)
+
+    # ── Cash at Stores: last entry on or before each day, per entity ─────────
+    cash = pd.Series(0.0, index=days)
+    if not cash_rows.empty:
+        cash_rows["entry_date"] = pd.to_datetime(cash_rows["entry_date"])
+        for _ent, g in cash_rows.groupby("entity"):
+            s = g.groupby("entry_date")["value"].last()
+            s = s.reindex(s.index.union(days)).ffill().reindex(days)
+            cash += s.fillna(0.0)
+
+    out = pd.DataFrame({"date": days.strftime("%Y-%m-%d"), "bank": bank_total.values,
+                        "fd": fd.values, "mf": mf.values, "cash": cash.values})
+    out["total"] = out["bank"] + out["fd"] + out["mf"] + out["cash"]
+    return out.iloc[::-1].to_dict("records")
 
 
 if __name__ == "__main__":

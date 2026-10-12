@@ -3,6 +3,8 @@
 import streamlit as st
 import pandas as pd
 from database import reload_categories
+from utils.formatters import fmt_inr
+from utils.ui import amount_config
 
 
 def render_review_queue(uncats):
@@ -20,11 +22,12 @@ def render_review_queue(uncats):
         df_unc = pd.DataFrame(uncats)
         df_unc.columns = ["Narration", "Entity", "Count", "Total Debit (₹)"]
         df_unc["Total Debit (₹)"] = df_unc["Total Debit (₹)"].apply(
-            lambda x: f"₹{x:,.0f}" if x else "—"
+            lambda x: fmt_inr(x)
         )
         df_unc = df_unc.sort_values("Count", ascending=False)
         st.metric("Total uncategorized narration patterns", len(uncats))
-        st.dataframe(df_unc, use_container_width=True, hide_index=True, height=400)
+        st.dataframe(df_unc, use_container_width=True, hide_index=True, height=400,
+                     column_config=amount_config(["Total Debit (₹)"]))
         st.markdown("---")
         st.markdown("**How to fix:**")
         st.markdown("1. Open `keywords_master.xlsx`")

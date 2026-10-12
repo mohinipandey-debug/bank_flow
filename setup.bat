@@ -35,6 +35,8 @@ if not exist "statements\Stores\AXIS-8218"    mkdir "statements\Stores\AXIS-8218
 if not exist "statements\Stores\AXIS-7647"    mkdir "statements\Stores\AXIS-7647"
 if not exist "statements\Ventures\AXIS-5623"  mkdir "statements\Ventures\AXIS-5623"
 if not exist "statements\Ventures\HDFC-7862"  mkdir "statements\Ventures\HDFC-7862"
+if not exist "statements\Stores\HDFC-5881"    mkdir "statements\Stores\HDFC-5881"
+if not exist "statements\Ventures\HDFC-7640"  mkdir "statements\Ventures\HDFC-7640"
 if not exist "processed"                       mkdir "processed"
 if not exist "data"                            mkdir "data"
 

@@ -48,6 +48,34 @@ def get_bank_closing_balance(entity, d_to, db_file=None):
     return closing
 
 
+def get_investment_flows(entity, d_from, d_to, db_file):
+    """
+    MF/FD balance-side movements between d_from and d_to (inclusive): the amounts that
+    change the Mutual Fund / Fixed Deposit balance used in the Opening/Closing totals
+    (manual FD/MF entries + any bank transactions with main_group='INVESTMENT' — the
+    exact sources database.get_entity_investment_asof uses).
+    Returns {"invested": +, "redeemed": +}.
+    """
+    conn = sqlite3.connect(db_file)
+    ent_sql, ent_p = "", []
+    if entity and entity != "All":
+        ent_sql, ent_p = " AND entity = ?", [entity]
+    m = conn.execute(f"""
+        SELECT COALESCE(SUM(CASE WHEN entry_type='Invested' THEN amount ELSE 0 END),0),
+               COALESCE(SUM(CASE WHEN entry_type='Redeemed' THEN amount ELSE 0 END),0)
+        FROM manual_investments
+        WHERE entry_date BETWEEN ? AND ? {ent_sql}
+    """, [d_from, d_to] + ent_p).fetchone()
+    t = conn.execute(f"""
+        SELECT COALESCE(SUM(CASE WHEN debit>0  THEN debit  ELSE 0 END),0),
+               COALESCE(SUM(CASE WHEN credit>0 THEN credit ELSE 0 END),0)
+        FROM transactions
+        WHERE UPPER(main_group)='INVESTMENT' AND date BETWEEN ? AND ? {ent_sql}
+    """, [d_from, d_to] + ent_p).fetchone()
+    conn.close()
+    return {"invested": round(m[0] + t[0], 2), "redeemed": round(m[1] + t[1], 2)}
+
+
 def fetch_cf(entity, d_from, d_to, db_file, financial_year=None):
     """
     Returns all Cash Flow data for entity + date range.
@@ -253,24 +281,38 @@ def fetch_cf(entity, d_from, d_to, db_file, financial_year=None):
             else:
                 payouts_nested["Intercompany (Net)"]  = {"Intercompany (Net)": abs(ic_net)}
 
-    # --- Investment separation (must run AFTER receipts_nested/payouts_nested
-    # are final, i.e. after Interbank/Intercompany netting above) ---
-    # main_group is NEVER 'INVESTMENT' in this DB (confirmed: only '', 'Payment',
-    # 'Receipt', 'INTERBANK', 'INTERCOMPANY', 'OPENING BALANCE' occur there).
-    # The investment marker lives in group_name ('INVESTMENT' / 'Investment').
-    # conn is already closed at this point, so extract from the nested dicts
-    # already built from the DB rows rather than re-querying.
-    def _extract_investment(nested):
-        total = 0
-        for grp in list(nested.keys()):
-            if "investment" in grp.strip().lower():
-                total += sum(nested[grp].values())
-                del nested[grp]
-        return total
+    # --- Investments: now part of Receipts / Payouts ---------------------------
+    # Opening/Closing totals already include MF + FD balances, so BOTH sides of an
+    # investment movement are shown in the statement:
+    #   * bank side  — redemptions received / purchases paid (already in the nested
+    #                  dicts under the INVESTMENT group; no longer separated out)
+    #   * balance side — MF/FD purchases (adds to the investment balance) are a receipt
+    #                  into the investment bucket, redemptions at cost a payout from it.
+    # Result: Opening + Receipts - Payouts (+ Cash change) = Closing.
+    def _sum_investment(nested):
+        return sum(sum(v.values()) for g, v in nested.items() if "investment" in g.strip().lower())
 
-    investment_inflow  = _extract_investment(receipts_nested)
-    investment_outflow = _extract_investment(payouts_nested)
+    investment_inflow  = _sum_investment(receipts_nested)    # bank side, informational
+    investment_outflow = _sum_investment(payouts_nested)
     investment_net      = round(investment_inflow - investment_outflow, 2)
+
+    def _inv_group(nested):
+        for g in nested:
+            if "investment" in g.strip().lower():
+                return g
+        return "INVESTMENT"
+
+    flows = get_investment_flows(entity, d_from, d_to, db_file)
+    receipts_flat = {r["category"]: r["total"] or 0 for r in receipts}
+    payouts_flat  = {r["category"]: r["total"] or 0 for r in payouts}
+    if flows["invested"] > 0:
+        lbl = "MF/FD purchases (adds to investment balance)"
+        receipts_nested.setdefault(_inv_group(receipts_nested), {})[lbl] = flows["invested"]
+        receipts_flat[lbl] = flows["invested"]
+    if flows["redeemed"] > 0:
+        lbl = "MF/FD redemptions at cost (reduces investment balance)"
+        payouts_nested.setdefault(_inv_group(payouts_nested), {})[lbl] = flows["redeemed"]
+        payouts_flat[lbl] = flows["redeemed"]
 
     # Recompute totals from the now-cleaned nested dicts
     _total_rec = sum(sum(v.values()) for v in receipts_nested.values())
@@ -279,8 +321,8 @@ def fetch_cf(entity, d_from, d_to, db_file, financial_year=None):
     return {
         "opening_balances":        opening_balances,
         # flat dicts kept for Excel export / backwards-compat
-        "receipts":                {r["category"]: r["total"] or 0 for r in receipts},
-        "payouts":                 {r["category"]: r["total"] or 0 for r in payouts},
+        "receipts":                receipts_flat,
+        "payouts":                 payouts_flat,
         # nested dicts for GROUP → FINAL GROUP hierarchy display (post-netting)
         "receipts_nested":         receipts_nested,
         "payouts_nested":          payouts_nested,

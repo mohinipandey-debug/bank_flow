@@ -4,6 +4,8 @@ import streamlit as st
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
+from utils.formatters import fmt_inr
+from utils.ui import amount_config
 
 
 def render_overview(summary):
@@ -141,6 +143,7 @@ def render_overview(summary):
         df_cat_full = pd.DataFrame(by_cat)
         df_cat_full.columns = ["Category", "Group", "Main Group", "Total (₹)"]
         df_cat_full["Total (₹)"] = df_cat_full["Total (₹)"].apply(
-            lambda x: f"₹{x:,.0f}"
+            lambda x: fmt_inr(x)
         )
-        st.dataframe(df_cat_full, use_container_width=True, hide_index=True)
+        st.dataframe(df_cat_full, use_container_width=True, hide_index=True,
+                     column_config=amount_config(["Total (₹)"]))
