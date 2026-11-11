@@ -4841,3 +4841,58 @@ elif selected_tab == "Upload":
             st.info("A backup of the previous database was saved as bankflow.db.bak")
         except Exception as _e:
             st.error(f"❌ Restore failed: {_e}")
+
+    # ── DB Download (read-only snapshot) ──────────────────────────────────────
+    st.markdown("---")
+    st.markdown("### Download Database")
+    st.markdown("""
+<div style="background:#EBF4FF; border-left:4px solid #3B82F6;
+     border-radius:6px; padding:10px 16px; margin-bottom:16px;
+     font-size:13px; color:#1E40AF;">
+    Creates a compressed copy (<b>.gz</b>) of the current database. Click
+    <b>Prepare download</b>, wait for it to finish, then click <b>Download</b>.
+    Unzip it to get <code>bankflow.db</code>. This only reads the database &mdash; nothing is changed.
+</div>
+""", unsafe_allow_html=True)
+
+    if st.button("📦 Prepare download", key="db_prepare_btn"):
+        import sqlite3 as _sq_dl
+        import gzip as _gz_dl
+        import shutil as _sh_dl
+        import tempfile as _tf_dl
+        _tmp_db = _tmp_gz = None
+        try:
+            with st.spinner("Creating a consistent snapshot and compressing it..."):
+                _tmp_db = _tf_dl.NamedTemporaryFile(delete=False, suffix=".db")
+                _tmp_db.close()
+                _tmp_gz = _tf_dl.NamedTemporaryFile(delete=False, suffix=".gz")
+                _tmp_gz.close()
+                _src = _sq_dl.connect(f"file:{DATABASE_FILE}?mode=ro", uri=True)
+                _dst = _sq_dl.connect(_tmp_db.name)
+                _src.backup(_dst)          # consistent copy even while the app is in use
+                _dst.close()
+                _src.close()
+                with open(_tmp_db.name, "rb") as _fin, _gz_dl.open(_tmp_gz.name, "wb", compresslevel=6) as _fout:
+                    _sh_dl.copyfileobj(_fin, _fout, 1024 * 1024)
+                with open(_tmp_gz.name, "rb") as _fz:
+                    st.session_state["db_download_bytes"] = _fz.read()
+                st.session_state["db_download_name"] = (
+                    f"bankflow_{datetime.date.today().isoformat()}.db.gz")
+        except Exception as _e:
+            st.session_state.pop("db_download_bytes", None)
+            st.error(f"❌ Could not prepare the download: {_e}")
+        finally:
+            for _t in (_tmp_db, _tmp_gz):
+                if _t is not None:
+                    try:
+                        _os_up.unlink(_t.name)
+                    except OSError:
+                        pass
+
+    if st.session_state.get("db_download_bytes"):
+        _dl_bytes = st.session_state["db_download_bytes"]
+        st.success(f"Ready — {len(_dl_bytes) / 1e6:,.1f} MB compressed.")
+        st.download_button(
+            "⬇️ Download database (.gz)", _dl_bytes,
+            file_name=st.session_state.get("db_download_name", "bankflow.db.gz"),
+            mime="application/gzip", key="db_download_btn")
