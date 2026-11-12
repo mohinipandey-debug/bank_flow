@@ -90,6 +90,23 @@ def init_db():
     except Exception:
         pass
 
+    # Migration: ord_key = position of the row within its day, used wherever "the last
+    # transaction of the day" matters (closing balances). Defaults to the load order (id);
+    # rows from a complete statement day are re-stamped with the statement's own order.
+    try:
+        conn.execute("ALTER TABLE transactions ADD COLUMN ord_key INTEGER")
+        conn.commit()
+    except Exception:
+        pass  # Already exists
+    if conn.execute("SELECT 1 FROM transactions WHERE ord_key IS NULL LIMIT 1").fetchone():
+        conn.execute("UPDATE transactions SET ord_key = id WHERE ord_key IS NULL")
+        conn.commit()
+    try:
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_txn_bank_date_ord ON transactions(bank, date, ord_key)")
+        conn.commit()
+    except Exception:
+        pass
+
     # Backfill financial_year for any rows that don't have it yet
     conn.execute("""
         UPDATE transactions
@@ -237,6 +254,62 @@ def init_db():
     """)
     conn.commit()
 
+    # Capital-gain support: units / NAV on manual MF entries, historical lots, open lots, FD rate card
+    for _col in ("units REAL", "nav REAL"):
+        try:
+            conn.execute(f"ALTER TABLE manual_investments ADD COLUMN {_col}")
+            conn.commit()
+        except Exception:
+            pass  # Already exists
+
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS mf_historical_lots (
+            id            INTEGER PRIMARY KEY AUTOINCREMENT,
+            entity        TEXT NOT NULL,
+            fund_type     TEXT,
+            scheme_name   TEXT,
+            purchase_date TEXT NOT NULL,
+            units         REAL NOT NULL,
+            purchase_nav  REAL NOT NULL,
+            sale_date     TEXT NOT NULL,
+            units_sold    REAL NOT NULL,
+            sale_nav      REAL NOT NULL,
+            fd_rate       REAL,
+            imported_at   TEXT DEFAULT (datetime('now','localtime'))
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS mf_opening_lots (
+            id            INTEGER PRIMARY KEY AUTOINCREMENT,
+            entity        TEXT NOT NULL,
+            scheme_name   TEXT NOT NULL,
+            fund_type     TEXT,
+            purchase_date TEXT NOT NULL,
+            units         REAL NOT NULL,
+            nav           REAL NOT NULL,
+            imported_at   TEXT DEFAULT (datetime('now','localtime'))
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS fd_rate_card (
+            min_days INTEGER PRIMARY KEY,
+            label    TEXT NOT NULL,
+            rate     REAL NOT NULL
+        )
+    """)
+    if conn.execute("SELECT COUNT(*) FROM fd_rate_card").fetchone()[0] == 0:
+        conn.executemany("INSERT INTO fd_rate_card (min_days, label, rate) VALUES (?,?,?)", [
+            (0,   "Under 7 days",   0.0),
+            (7,   "7 - 14 days",    0.0475),
+            (15,  "15 - 29 days",   0.0475),
+            (30,  "30 - 45 days",   0.055),
+            (46,  "46 - 60 days",   0.0575),
+            (61,  "61 - 89 days",   0.06),
+            (90,  "90 - 119 days",  0.065),
+            (120, "120 days & above", 0.07),
+        ])
+    conn.commit()
+
     # A2 — Investment transaction tagging
     conn.execute("""
         CREATE TABLE IF NOT EXISTS investment_txn_mapping (
@@ -304,8 +377,17 @@ def _date_to_fy(date_str):
         return None
 
 
-def make_fingerprint(entity, bank, date, narration, debit, credit):
+def make_fingerprint(entity, bank, date, narration, debit, credit, occurrence=0):
+    """
+    occurrence = 0 for the first copy of an identical row (date+narration+amounts),
+    1, 2, ... for further identical copies in the same statement. Occurrence 0 keeps
+    the historical fingerprint, so existing data and re-uploads still de-duplicate,
+    while genuinely repeated transactions (e.g. two identical cheques the same day)
+    are no longer dropped as "duplicates".
+    """
     raw = f"{entity}|{bank}|{date}|{narration}|{debit}|{credit}"
+    if occurrence:
+        raw += f"|#{occurrence}"
     return hashlib.md5(raw.encode()).hexdigest()
 
 
@@ -314,6 +396,8 @@ def insert_transactions(rows):
     c = conn.cursor()
     inserted = 0
     skipped  = 0
+    seen_in_batch = {}      # identical-row counter within this statement
+    day_rows = {}           # (bank, date) -> [(fingerprint, statement position)]
 
     for row in rows:
         # Skip duplicate Opening Balance rows — keep only first per bank
@@ -327,11 +411,15 @@ def insert_transactions(rows):
                 print(f"[OB] Skipping duplicate OB for {row['bank']}")
                 continue
 
-        fp = make_fingerprint(
-            row["entity"], row["bank"], row["date"],
-            row["narration"], row["debit"], row["credit"]
-        )
+        _key = (row["entity"], row["bank"], row["date"],
+                row["narration"], row["debit"], row["credit"])
+        _occ = seen_in_batch.get(_key, 0)
+        seen_in_batch[_key] = _occ + 1
+        fp = make_fingerprint(*_key, occurrence=_occ)
         fy = _date_to_fy(row["date"])
+        if row.get("stmt_seq") is not None and row.get("final_group") != "OPENING BALANCE":
+            day_rows.setdefault((row["bank"], row["date"]), []).append(
+                (fp, int(row["stmt_seq"])))
         try:
             c.execute("""
                 INSERT INTO transactions
@@ -359,6 +447,21 @@ def insert_transactions(rows):
         except Exception as exc:
             skipped += 1
             print(f"[DB] ERROR inserting row ({row.get('bank')} {row.get('date')}): {exc}")
+
+    # New rows take their load order as ord_key (same as id)
+    c.execute("UPDATE transactions SET ord_key = id WHERE ord_key IS NULL")
+
+    # If this statement contains EVERY row now stored for a day, it is authoritative for
+    # that day's order: re-stamp all of the day's rows (new and already-loaded) with the
+    # statement's own row order. Partial statements leave the order untouched.
+    for (bank, date), items in day_rows.items():
+        stored = c.execute(
+            "SELECT COUNT(*) FROM transactions "
+            "WHERE bank=? AND date=? AND final_group != 'OPENING BALANCE'",
+            [bank, date]).fetchone()[0]
+        if stored == len(items):
+            c.executemany("UPDATE transactions SET ord_key=? WHERE fingerprint=?",
+                          [(seq, fp) for fp, seq in items])
 
     conn.commit()
     conn.close()
@@ -860,7 +963,7 @@ def get_missing_statements(financial_year=None):
                     AND date=?
                     AND final_group != 'OPENING BALANCE'
                     AND balance IS NOT NULL
-                    ORDER BY id DESC LIMIT 1
+                    ORDER BY ord_key DESC LIMIT 1
                 """, [bank, last_date]).fetchone()
                 if cb_row:
                     closing_bal = cb_row["balance"]
@@ -956,7 +1059,7 @@ def get_closing_balance(entity=None, bank=None, month=None, financial_year=None,
         SELECT bank, balance, date
         FROM transactions
         {where}
-        ORDER BY bank, date DESC, id DESC
+        ORDER BY bank, date DESC, ord_key DESC
     """, params).fetchall()
 
     seen_banks = set()
@@ -1028,7 +1131,7 @@ def get_entity_closing_balance(entity, financial_year=None):
             AND final_group != 'OPENING BALANCE'
             AND balance IS NOT NULL
             {fy_clause}
-            ORDER BY date DESC, id DESC LIMIT 1
+            ORDER BY date DESC, ord_key DESC LIMIT 1
         """, [bank, entity] + fy_params).fetchone()
 
         if row and row["balance"] is not None:
@@ -1123,7 +1226,7 @@ def get_paginated_transactions(entity=None, bank=None, month=None,
         f"       source_file, loaded_at,"
         f"       COALESCE(manually_overridden, 0) as manually_overridden"
         f" FROM transactions {where}"
-        f" ORDER BY date DESC, id DESC LIMIT ? OFFSET ?",
+        f" ORDER BY date DESC, ord_key DESC LIMIT ? OFFSET ?",
         params + [page_size, offset]
     ).fetchall()
 
@@ -1243,14 +1346,14 @@ def get_cashflow(entity=None, date_from=None, date_to=None):
     for _ent, bank in accounts:
         r = conn.execute(
             "SELECT balance FROM transactions WHERE bank=? AND balance IS NOT NULL"
-            + date_cond + " ORDER BY date ASC, id ASC LIMIT 1",
+            + date_cond + " ORDER BY date ASC, ord_key ASC LIMIT 1",
             [bank] + date_p
         ).fetchone()
         opening_balances[bank] = r[0] if r else None
 
         r = conn.execute(
             "SELECT balance FROM transactions WHERE bank=? AND balance IS NOT NULL"
-            + date_cond + " ORDER BY date DESC, id DESC LIMIT 1",
+            + date_cond + " ORDER BY date DESC, ord_key DESC LIMIT 1",
             [bank] + date_p
         ).fetchone()
         closing_balances[bank] = r[0] if r else None
@@ -1677,7 +1780,7 @@ def get_account_balances(financial_year=None):
             WHERE bank = ?
               {fy_filter}
               AND final_group != 'OPENING BALANCE'
-            ORDER BY date DESC, rowid DESC
+            ORDER BY date DESC, ord_key DESC
             LIMIT 1
         """, [bank_id] + fy_params).fetchone()
 
@@ -1727,7 +1830,7 @@ def get_account_balances_asof(as_of_date, entity_filter=None, bank_filter=None):
             AND date <= ?
             AND final_group != 'OPENING BALANCE'
             AND balance IS NOT NULL
-            ORDER BY date DESC, id DESC LIMIT 1
+            ORDER BY date DESC, ord_key DESC LIMIT 1
         """, [bank_id, as_of_date]).fetchone()
 
         if row and row["balance"] is not None:
@@ -1917,15 +2020,26 @@ def get_tab_summary_cached(entity, bank, month, financial_year):
 
 
 def add_manual_investment(entry_date, scheme_name, scheme_type,
-                          amount, entry_type, entity, notes=""):
+                          amount, entry_type, entity, notes="", units=None, nav=None):
+    """
+    units + nav (MF only): the entry takes part in FIFO capital-gain matching and its
+    `amount` (the balance impact at cost) is maintained automatically:
+      purchase   -> units x NAV
+      redemption -> cost of the oldest purchase lots it consumes (FIFO)
+    Returns the new entry id.
+    """
     conn = get_connection()
-    conn.execute("""
+    cur = conn.execute("""
         INSERT INTO manual_investments
-        (entry_date, scheme_name, scheme_type, amount, entry_type, entity, notes)
-        VALUES (?,?,?,?,?,?,?)
-    """, [entry_date, scheme_name, scheme_type, amount, entry_type, entity, notes])
+        (entry_date, scheme_name, scheme_type, amount, entry_type, entity, notes, units, nav)
+        VALUES (?,?,?,?,?,?,?,?,?)
+    """, [entry_date, scheme_name, scheme_type, amount, entry_type, entity, notes, units, nav])
+    entry_id = cur.lastrowid
     conn.commit()
     conn.close()
+    if units and nav:
+        refresh_fifo_amounts()
+    return entry_id
 
 
 def get_manual_investments():
@@ -1942,6 +2056,7 @@ def delete_manual_investment(entry_id):
     conn.execute("DELETE FROM manual_investments WHERE id=?", [entry_id])
     conn.commit()
     conn.close()
+    refresh_fifo_amounts()      # later redemptions may now match different lots
 
 
 def get_manual_investment_totals():
@@ -2232,7 +2347,7 @@ def get_entity_bank_balance_asof(entity, as_of_date):
             AND date <= ?
             AND final_group != 'OPENING BALANCE'
             AND balance IS NOT NULL
-            ORDER BY date DESC, id DESC LIMIT 1
+            ORDER BY date DESC, ord_key DESC LIMIT 1
         """, [bank, entity, as_of_date]).fetchone()
 
         if row and row["balance"] is not None:
@@ -2286,6 +2401,95 @@ def get_entity_investment_asof(entity, as_of_date):
     return opening + txn_net + man_net
 
 
+def get_data_integrity_report(today=None, since="2026-04-01"):
+    """
+    Detects statements that were never uploaded / only partly loaded.
+    Checks dates from `since` (the live statement period; the FY2025-26 Excel import
+    has no reliable day-level balances).
+
+    breaks  : list of {bank, date, expected, actual, diff, after_gap, gap_days}
+        For every loaded day: previous day's closing balance + credits - debits
+        must equal that day's closing balance (the balance printed by the bank).
+        A difference means transactions are missing (or duplicated).
+    missing : list of {bank, from, to, days, kind}
+        kind 'gap'        – days with no rows whose absence is confirmed by a balance
+                            break on the next loaded day (busy accounts only; a quiet
+                            day with genuinely no transactions is not flagged)
+        kind 'not loaded' – nothing loaded for the most recent days (3+ days)
+    """
+    import pandas as pd
+
+    today = today or datetime.date.today()
+    conn = get_connection()
+    df = pd.read_sql_query(
+        "SELECT id, bank, date, debit, credit, balance FROM transactions "
+        "WHERE final_group != 'OPENING BALANCE' AND date >= '2025-04-01' "
+        "ORDER BY bank, date, ord_key", conn)
+    conn.close()
+
+    missing, breaks, daily_banks = [], [], []
+    since_ts = pd.Timestamp(since)
+    for bank, g in df.groupby("bank"):
+        g = g.copy()
+        g["d"] = pd.to_datetime(g["date"])
+        dates = pd.DatetimeIndex(sorted(g["d"].unique()))
+        if len(dates) < 30:
+            continue
+
+        # ── balance continuity, day by day ──
+        day = g.groupby("d").agg(cr=("credit", "sum"), dr=("debit", "sum"))
+        close = g.dropna(subset=["balance"]).groupby("d")["balance"].last()
+        day = day.join(close.rename("close"), how="inner")
+        bank_breaks, prev_close, prev_date = {}, None, None
+        for d, r in day.iterrows():
+            if prev_close is not None and d >= since_ts:
+                expected = prev_close + r["cr"] - r["dr"]
+                diff = round(r["close"] - expected, 2)
+                if abs(diff) > 1:
+                    bank_breaks[d] = {
+                        "bank": bank, "date": d.strftime("%Y-%m-%d"),
+                        "expected": round(expected, 2), "actual": round(r["close"], 2),
+                        "diff": diff,
+                        "after_gap": (d - prev_date).days > 1,
+                        "gap_days": (d - prev_date).days - 1,
+                    }
+            prev_close, prev_date = r["close"], d
+        breaks.extend(bank_breaks.values())
+
+        # ── missing days (busy accounts only) ──
+        recent = dates[dates >= dates.max() - pd.Timedelta(days=120)]
+        span   = (dates.max() - max(dates.min(), dates.max() - pd.Timedelta(days=120))).days + 1
+        if not (span > 0 and len(recent) / span >= 0.90):
+            continue
+        daily_banks.append(bank)
+        live = dates[dates >= since_ts]
+        if len(live):
+            gaps = pd.date_range(live.min(), live.max(), freq="D").difference(dates)
+            rng = []
+            for d in gaps:
+                if rng and (d - rng[-1][1]).days == 1:
+                    rng[-1][1] = d
+                else:
+                    rng.append([d, d])
+            for a_, b_ in rng:
+                nxt = dates[dates > b_]
+                if len(nxt) and nxt[0] in bank_breaks:      # absence confirmed by a balance break
+                    missing.append({"bank": bank, "from": a_.strftime("%Y-%m-%d"),
+                                    "to": b_.strftime("%Y-%m-%d"),
+                                    "days": (b_ - a_).days + 1, "kind": "gap"})
+        if (pd.Timestamp(today) - dates.max()).days >= 3:
+            a_ = dates.max() + pd.Timedelta(days=1)
+            b_ = pd.Timestamp(today) - pd.Timedelta(days=1)
+            missing.append({"bank": bank, "from": a_.strftime("%Y-%m-%d"),
+                            "to": b_.strftime("%Y-%m-%d"),
+                            "days": (b_ - a_).days + 1, "kind": "not loaded"})
+
+    missing.sort(key=lambda x: (x["from"], x["bank"]), reverse=True)
+    breaks.sort(key=lambda x: (x["date"], x["bank"]), reverse=True)
+    return {"missing": missing, "breaks": breaks, "daily_banks": daily_banks,
+            "net_diff": round(sum(b["diff"] for b in breaks), 2)}
+
+
 def get_latest_data_date():
     """Most recent transaction date in DB — used as default 'as on' date."""
     conn = get_connection()
@@ -2314,7 +2518,7 @@ def get_daywise_totals():
     tx = pd.read_sql_query(
         "SELECT entity, bank, date, balance FROM transactions "
         "WHERE final_group != 'OPENING BALANCE' AND balance IS NOT NULL "
-        "ORDER BY date, id", conn)
+        "ORDER BY date, ord_key", conn)
     pairs = [(r["entity"], r["bank"]) for r in conn.execute(
         "SELECT DISTINCT entity, bank FROM transactions").fetchall()]
     ob = {}
@@ -2368,6 +2572,346 @@ def get_daywise_totals():
                         "fd": fd.values, "mf": mf.values, "cash": cash.values})
     out["total"] = out["bank"] + out["fd"] + out["mf"] + out["cash"]
     return out.iloc[::-1].to_dict("records")
+
+
+# ═════════════════════════ Capital gains: lots, FIFO, FD comparison ═════════════════════════
+
+def _fund_type(text):
+    t = (text or "").lower()
+    if "arbitrage" in t:
+        return "Arbitrage"
+    if "money" in t:
+        return "Money Market"
+    if "liquid" in t:
+        return "Liquid"
+    return "Other"
+
+
+def _scheme_key(name):
+    import re
+    return re.sub(r"[^a-z0-9]", "", (name or "").lower())
+
+
+def _fy_label(date_str):
+    y, m = int(date_str[:4]), int(date_str[5:7])
+    start = y if m >= 4 else y - 1
+    return f"FY {start}-{str(start + 1)[2:]}"
+
+
+def get_fd_rate_card():
+    conn = get_connection()
+    rows = conn.execute("SELECT min_days, label, rate FROM fd_rate_card ORDER BY min_days").fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+def save_fd_rate_card(rows):
+    """rows: list of {min_days, label, rate} — replaces the whole card."""
+    conn = get_connection()
+    conn.execute("DELETE FROM fd_rate_card")
+    conn.executemany("INSERT INTO fd_rate_card (min_days, label, rate) VALUES (?,?,?)",
+                     [(int(r["min_days"]), str(r["label"]), float(r["rate"])) for r in rows])
+    conn.commit()
+    conn.close()
+
+
+def _slab_for_days(days, card):
+    pick = card[0]
+    for slab in card:
+        if days >= slab["min_days"]:
+            pick = slab
+    return pick
+
+
+def import_cg_sheet(filepath):
+    """
+    One-time load of the historical capital-gain workbook (one sheet per entity:
+    names containing CKVPL/Ventures or CKSPL/Stores). Hidden sheets are ignored.
+    Every lot is re-derived from the raw inputs (purchase date, units, NAV, sale date,
+    units sold, sale NAV) — the sheet's own formulas are not trusted. Replaces all
+    previously loaded historical lots.
+    Returns {"loaded": {entity: n}, "skipped": n, "gain": {entity: gain}, "sheet_gain_diff": x, "errors": [...]}
+    """
+    import openpyxl
+    import datetime as _dtm
+
+    def num(v):
+        try:
+            return float(v)
+        except (TypeError, ValueError):
+            return None
+
+    def dstr(v):
+        if isinstance(v, _dtm.datetime):
+            return v.strftime("%Y-%m-%d")
+        if isinstance(v, _dtm.date):
+            return v.strftime("%Y-%m-%d")
+        return None
+
+    try:
+        wb = openpyxl.load_workbook(filepath, data_only=True)
+    except Exception as exc:
+        return {"loaded": {}, "skipped": 0, "gain": {}, "sheet_gain_diff": 0, "errors": [str(exc)]}
+
+    lots, skipped, errors = [], 0, []
+    sheet_gain = {}
+    for ws in wb.worksheets:
+        if ws.sheet_state != "visible":
+            continue
+        up = ws.title.upper()
+        entity = ("Ventures" if ("CKVPL" in up or "VENTURES" in up) else
+                  "Stores" if ("CKSPL" in up or "STORES" in up) else None)
+        if not entity:
+            continue
+
+        hdr_row, hdr = None, None
+        for i, row in enumerate(ws.iter_rows(min_row=1, max_row=15, values_only=True), 1):
+            vals = [str(v).strip().upper() if v is not None else "" for v in row]
+            if "PURCHASE DATE" in vals and "UNITS SOLD" in vals:
+                hdr_row, hdr = i, vals
+                break
+        if hdr is None:
+            errors.append(f"Sheet '{ws.title}': header row (PURCHASE DATE / UNITS SOLD) not found")
+            continue
+        c_p = hdr.index("PURCHASE DATE")
+        c_units, c_pnav = c_p + 1, c_p + 2
+        c_sale = next(i for i in range(c_p + 1, len(hdr)) if hdr[i].startswith("DATE"))
+        c_us = hdr.index("UNITS SOLD")
+        c_snav = c_us + 1
+        c_gain = hdr.index("CAP. GAIN") if "CAP. GAIN" in hdr else None
+        c_rate = hdr.index("INTEREST %") if "INTEREST %" in hdr else None
+
+        last_ft, last_raw = "Other", ""
+        for row in ws.iter_rows(min_row=hdr_row + 1, values_only=True):
+            row = list(row) + [None] * (len(hdr) + 2 - len(row))
+            a = str(row[0]).strip() if row[0] else ""
+            b = str(row[1]).strip() if row[1] else ""
+            raw = b or (a if a and not a.upper().startswith("FY") else "")
+            if raw:
+                last_ft, last_raw = _fund_type(raw), raw
+            pdt, sdt = dstr(row[c_p]), dstr(row[c_sale])
+            units, pnav = num(row[c_units]), num(row[c_pnav])
+            us, snav = num(row[c_us]), num(row[c_snav])
+            if not (pdt and sdt and units and pnav and us and snav):
+                if row[c_p] is not None or row[c_sale] is not None:
+                    skipped += 1
+                continue
+            rate = num(row[c_rate]) if c_rate is not None else None
+            lots.append((entity, last_ft, last_raw or last_ft, pdt, units, pnav, sdt, us, snav,
+                         rate if rate else None))
+            if c_gain is not None and num(row[c_gain]) is not None:
+                sheet_gain[entity] = sheet_gain.get(entity, 0) + num(row[c_gain])
+
+    if not lots:
+        return {"loaded": {}, "skipped": skipped, "gain": {}, "sheet_gain_diff": 0,
+                "errors": errors or ["No capital-gain lots found in the workbook."]}
+
+    conn = get_connection()
+    conn.execute("DELETE FROM mf_historical_lots")
+    conn.executemany("""
+        INSERT INTO mf_historical_lots
+        (entity, fund_type, scheme_name, purchase_date, units, purchase_nav,
+         sale_date, units_sold, sale_nav, fd_rate)
+        VALUES (?,?,?,?,?,?,?,?,?,?)
+    """, lots)
+    conn.commit()
+    conn.close()
+
+    loaded, gain = {}, {}
+    for l in lots:
+        loaded[l[0]] = loaded.get(l[0], 0) + 1
+        gain[l[0]] = gain.get(l[0], 0) + (l[8] - l[5]) * l[7]
+    diff = round(sum(gain.values()) - sum(sheet_gain.values()), 2) if sheet_gain else 0
+    return {"loaded": loaded, "skipped": skipped,
+            "gain": {k: round(v, 2) for k, v in gain.items()},
+            "sheet_gain_diff": diff, "errors": errors}
+
+
+def import_opening_lots(filepath):
+    """
+    Open (still held) purchase lots, loaded once so FIFO can match future redemptions.
+    Columns: Entity | Scheme Name | Fund Type (optional) | Purchase Date | Units | NAV
+    Replaces all previously loaded opening lots.
+    """
+    import pandas as pd
+    try:
+        df = pd.read_excel(filepath)
+    except Exception as exc:
+        return {"loaded": 0, "errors": [str(exc)]}
+    df.columns = [str(c).strip() for c in df.columns]
+    low = {c.lower(): c for c in df.columns}
+
+    def col(*names):
+        for n in names:
+            if n in low:
+                return low[n]
+        return None
+
+    c_ent, c_sch = col("entity"), col("scheme name", "scheme")
+    c_ft, c_dt = col("fund type", "type"), col("purchase date", "date")
+    c_un, c_nav = col("units"), col("nav", "purchase nav")
+    missing = [n for n, c in [("Entity", c_ent), ("Scheme Name", c_sch), ("Purchase Date", c_dt),
+                              ("Units", c_un), ("NAV", c_nav)] if c is None]
+    if missing:
+        return {"loaded": 0, "errors": [f"Missing columns: {missing}. Found: {list(df.columns)}"]}
+
+    rows, errors = [], []
+    for i, r in df.iterrows():
+        try:
+            ent = str(r[c_ent]).strip().title()
+            if ent not in ("Stores", "Ventures"):
+                raise ValueError(f"Entity must be Stores or Ventures, got '{r[c_ent]}'")
+            sch = str(r[c_sch]).strip()
+            dt = pd.to_datetime(r[c_dt]).strftime("%Y-%m-%d")
+            units, nav = float(r[c_un]), float(r[c_nav])
+            if units <= 0 or nav <= 0:
+                raise ValueError("Units and NAV must be positive")
+            ft = _fund_type(str(r[c_ft]) if c_ft and str(r[c_ft]) != "nan" else sch)
+            rows.append((ent, sch, ft, dt, units, nav))
+        except Exception as exc:
+            errors.append(f"Row {i + 2}: {exc}")
+    if errors:
+        return {"loaded": 0, "errors": errors}
+    conn = get_connection()
+    conn.execute("DELETE FROM mf_opening_lots")
+    conn.executemany("INSERT INTO mf_opening_lots (entity, scheme_name, fund_type, purchase_date, units, nav) "
+                     "VALUES (?,?,?,?,?,?)", rows)
+    conn.commit()
+    conn.close()
+    refresh_fifo_amounts()
+    return {"loaded": len(rows), "errors": []}
+
+
+def get_opening_lots():
+    conn = get_connection()
+    rows = conn.execute("SELECT * FROM mf_opening_lots ORDER BY entity, scheme_name, purchase_date").fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+def compute_fifo(entity=None):
+    """
+    FIFO matching, recomputed from scratch from the inputs (so edits/deletes are always consistent):
+      lots      = opening lots + MF 'Invested' entries that carry units and NAV
+      redeems   = MF 'Redeemed' entries that carry units and NAV
+    Each redemption consumes the oldest lots of the same entity+scheme first.
+    Returns {"closed": [...], "open": [...], "unmatched": [...]}.
+    """
+    conn = get_connection()
+    ent_sql, ent_p = "", []
+    if entity and entity != "All":
+        ent_sql, ent_p = " AND entity=?", [entity]
+
+    events = []   # (date, order, seq, kind, payload)
+    for r in conn.execute(f"SELECT * FROM mf_opening_lots WHERE 1=1{ent_sql}", ent_p).fetchall():
+        events.append((r["purchase_date"], 0, r["id"], "P", dict(
+            entity=r["entity"], scheme=r["scheme_name"], fund=r["fund_type"] or _fund_type(r["scheme_name"]),
+            date=r["purchase_date"], units=r["units"], nav=r["nav"], src="Opening")))
+    for r in conn.execute(
+            f"SELECT * FROM manual_investments WHERE scheme_type='MF' AND units>0 AND nav>0{ent_sql} "
+            f"ORDER BY entry_date, id", ent_p).fetchall():
+        d = dict(entity=r["entity"], scheme=r["scheme_name"], fund=_fund_type(r["scheme_name"]),
+                 date=r["entry_date"], units=r["units"], nav=r["nav"], entry_id=r["id"])
+        if r["entry_type"] == "Invested":
+            d["src"] = "Purchase"
+            events.append((r["entry_date"], 0, r["id"] + 10_000_000, "P", d))
+        else:
+            events.append((r["entry_date"], 1, r["id"], "R", d))
+    conn.close()
+    events.sort(key=lambda e: (e[0], e[1], e[2]))
+
+    books, closed, unmatched = {}, [], []
+    for _date, _o, _seq, kind, d in events:
+        key = (d["entity"], _scheme_key(d["scheme"]))
+        book = books.setdefault(key, [])
+        if kind == "P":
+            book.append(dict(d, left=d["units"]))
+            continue
+        need = d["units"]
+        for lot in book:
+            if need <= 1e-9:
+                break
+            if lot["left"] <= 1e-9 or lot["date"] > d["date"]:
+                continue
+            take = min(lot["left"], need)
+            lot["left"] -= take
+            need -= take
+            closed.append(dict(
+                entity=d["entity"], fund_type=d["fund"], scheme_name=d["scheme"],
+                purchase_date=lot["date"], units=take, purchase_nav=lot["nav"],
+                sale_date=d["date"], units_sold=take, sale_nav=d["nav"],
+                fd_rate=None, source="FIFO", entry_id=d["entry_id"]))
+        if need > 1e-6:
+            unmatched.append(dict(entry_id=d["entry_id"], entity=d["entity"], scheme_name=d["scheme"],
+                                  date=d["date"], units_short=round(need, 3), nav=d["nav"]))
+    open_lots = [dict(l, units=l["left"]) for b in books.values() for l in b if l["left"] > 1e-6]
+    return {"closed": closed, "open": open_lots, "unmatched": unmatched}
+
+
+def refresh_fifo_amounts():
+    """
+    Keep manual_investments.amount (the balance impact, at cost) in step with FIFO for entries
+    that carry units/NAV: purchase = units x NAV; redemption = FIFO cost consumed
+    (units that could not be matched are valued at the redemption NAV).
+    """
+    res = compute_fifo(None)
+    cost_by_entry = {}
+    for l in res["closed"]:
+        cost_by_entry[l["entry_id"]] = cost_by_entry.get(l["entry_id"], 0) + l["units_sold"] * l["purchase_nav"]
+    short_by_entry = {u["entry_id"]: u["units_short"] * u["nav"] for u in res["unmatched"]}
+    conn = get_connection()
+    for r in conn.execute("SELECT id, entry_type, units, nav FROM manual_investments "
+                          "WHERE scheme_type='MF' AND units>0 AND nav>0").fetchall():
+        if r["entry_type"] == "Invested":
+            amt = r["units"] * r["nav"]
+        else:
+            amt = cost_by_entry.get(r["id"], 0) + short_by_entry.get(r["id"], 0)
+        conn.execute("UPDATE manual_investments SET amount=? WHERE id=?", [round(amt, 2), r["id"]])
+    conn.commit()
+    conn.close()
+
+
+def get_capital_gain_lots(entity=None):
+    """
+    Every realised lot (historical sheet + FIFO from entries) with gain, days, ROI,
+    annualised return and the FD comparison:
+        FD interest = cost x FD rate x days / 365 (0 when held under 7 days, like the sheet)
+        benefit     = gain - FD interest      (positive: the mutual fund beat an FD)
+        missed      = FD interest - gain when positive (opportunity cost of choosing the MF)
+    FD rate: the sheet's own rate when it has one, otherwise the rate card slab for the holding period.
+    """
+    import datetime as _dtm
+    card = get_fd_rate_card()
+    conn = get_connection()
+    ent_sql, ent_p = "", []
+    if entity and entity != "All":
+        ent_sql, ent_p = " WHERE entity=?", [entity]
+    hist = [dict(r) for r in conn.execute(f"SELECT * FROM mf_historical_lots{ent_sql}", ent_p).fetchall()]
+    conn.close()
+    rows = [dict(h, source="Sheet") for h in hist] + compute_fifo(entity)["closed"]
+
+    out = []
+    for r in rows:
+        cost = r["units"] * r["purchase_nav"]
+        proceeds = r["units_sold"] * r["sale_nav"]
+        gain = proceeds - cost
+        days = (_dtm.date.fromisoformat(r["sale_date"]) - _dtm.date.fromisoformat(r["purchase_date"])).days
+        slab = _slab_for_days(days, card)
+        rate = r.get("fd_rate") or slab["rate"]
+        fd_days = days if days >= 7 else 0
+        fd_int = cost * rate * fd_days / 365
+        out.append(dict(
+            entity=r["entity"], fund_type=r.get("fund_type") or "Other", scheme_name=r.get("scheme_name"),
+            source=r["source"], purchase_date=r["purchase_date"], sale_date=r["sale_date"],
+            units=r["units"], purchase_nav=r["purchase_nav"], sale_nav=r["sale_nav"],
+            cost=cost, proceeds=proceeds, gain=gain, days=days,
+            roi=gain / cost if cost else 0.0,
+            ann=(gain / cost / days * 365) if (cost and days > 0) else 0.0,
+            slab=slab["label"], slab_min=slab["min_days"], fd_rate=rate, fd_interest=fd_int,
+            benefit=gain - fd_int, missed=max(0.0, fd_int - gain),
+            fy=_fy_label(r["sale_date"]), month=r["sale_date"][:7]))
+    out.sort(key=lambda x: (x["sale_date"], x["purchase_date"]))
+    return out
 
 
 if __name__ == "__main__":

@@ -23,6 +23,7 @@ from database import (
     delete_cash_entry, import_cash_excel,
     get_investment_transactions, tag_investment_transaction,
     get_investment_movements, get_investment_events, get_daywise_totals,
+    get_data_integrity_report, get_opening_lots, compute_fifo,
     add_manual_investment, get_manual_investments,
     delete_manual_investment, get_manual_investment_totals,
     get_entity_closing_balance, get_summary_with_bank,
@@ -115,6 +116,8 @@ def _cached_inv_header_totals():
 
 from queries.cashflow_queries import fetch_cf, get_mf_fd_cash_asof
 
+_integrity_raw = get_data_integrity_report     # uncached, for use right after an upload
+
 # ── Cache every read-only data query (5 min; any write calls st.cache_data.clear()) ──
 for _fn_name in (
     "get_monthly_trend", "get_yoy_comparison", "get_top_expenses_comparison",
@@ -127,11 +130,12 @@ for _fn_name in (
     "get_investment_transactions", "get_investment_summary",
     "get_uncategorized", "get_missing_statements", "get_large_debits",
     "get_transfer_reconciliation", "get_upload_trail", "get_category_audit",
-    "fetch_cf", "get_mf_fd_cash_asof", "get_daywise_totals",
+    "fetch_cf", "get_mf_fd_cash_asof", "get_daywise_totals", "get_data_integrity_report",
 ):
     globals()[_fn_name] = st.cache_data(ttl=300, show_spinner=False)(globals()[_fn_name])
 from tabs.overview import render_overview
 from tabs.review_queue import render_review_queue
+from tabs.investment_overview import render_investment_overview
 
 # ── Live-view badge — shown in tabs that are NOT filtered by FY ───────────────
 
@@ -2717,6 +2721,62 @@ elif selected_tab == "Exception Report":
 </div>
 """, unsafe_allow_html=True)
 
+    # ── Summary warning (details below) ───────────────────────────────────────
+    _integ = get_data_integrity_report()
+    if _integ["missing"] or _integ["breaks"]:
+        _miss_days = sum(m["days"] for m in _integ["missing"])
+        _parts = []
+        if _integ["missing"]:
+            _parts.append(f"<b>{len(_integ['missing'])}</b> period(s) with no statement loaded "
+                          f"({_miss_days} day(s))")
+        if _integ["breaks"]:
+            _parts.append(f"<b>{len(_integ['breaks'])}</b> day(s) where the bank balance does not tie "
+                          f"to the loaded transactions (net {fmt_inr(_integ['net_diff'])})")
+        st.markdown(f"""
+<div style="background:#FFF7ED; border:1px solid #FDBA74; border-left:5px solid #EA580C;
+     border-radius:10px; padding:11px 18px; margin:0 0 14px; font-size:13px; color:#7C2D12;">
+    ⚠️ <b>Data check:</b> {" &nbsp;·&nbsp; ".join(_parts)}.
+    Balances and cash flow may be incomplete.
+</div>""", unsafe_allow_html=True)
+
+    # ── Data integrity: missing statements + balance mismatches ───────────────
+    st.markdown("#### 🛡️ Data Integrity")
+    st.caption("Checks that every statement day is loaded and that each day's closing balance "
+               "equals the previous closing + credits − debits, using the balance printed by the bank.")
+    _ig = get_data_integrity_report()
+    if not _ig["missing"] and not _ig["breaks"]:
+        st.success("All clear — no missing statement dates and every balance ties.")
+    if _ig["missing"]:
+        st.markdown("**Missing statement dates** — upload the statement covering these dates")
+        _mdf = pd.DataFrame([{
+            "Account": m["bank"],
+            "From": datetime.date.fromisoformat(m["from"]).strftime("%d %b %Y"),
+            "To": datetime.date.fromisoformat(m["to"]).strftime("%d %b %Y"),
+            "Days": m["days"],
+            "Status": "Not yet loaded" if m["kind"] == "not loaded" else "Gap inside loaded data",
+        } for m in _ig["missing"]])
+        st.dataframe(_mdf, use_container_width=True, hide_index=True)
+    if _ig["breaks"]:
+        st.markdown(f"**Balance mismatches** — {len(_ig['breaks'])} day(s), net "
+                    f"{fmt_inr(_ig['net_diff'])}")
+        _bdf = pd.DataFrame([{
+            "Account": b["bank"],
+            "Date": datetime.date.fromisoformat(b["date"]).strftime("%d %b %Y"),
+            "Expected balance": fmt_inr(b["expected"], dash_zero=False),
+            "Bank balance": fmt_inr(b["actual"], dash_zero=False),
+            "Difference": fmt_inr(b["diff"]),
+            "Likely reason": (
+                f"{b['gap_days']} day(s) before this date not loaded" if b["after_gap"] else
+                "Transactions missing (credits)" if b["diff"] > 0 else
+                "Transactions missing (debits)"),
+        } for b in _ig["breaks"]])
+        st.dataframe(_bdf, use_container_width=True, hide_index=True,
+                     column_config=amount_config(["Expected balance", "Bank balance", "Difference"]))
+        st.caption("Difference = bank balance − (previous balance + credits − debits). "
+                   "Positive: credits are missing or extra debits were loaded. "
+                   "Negative: debits are missing or extra credits were loaded.")
+    st.markdown("")
+
     # All calls in this tab are unfiltered — full DB picture regardless of sidebar
     _exc_uncats      = get_uncategorized()
     _exc_stmt_status = get_missing_statements()
@@ -3990,6 +4050,16 @@ elif selected_tab == "Investments":
     fds = [r for r in inv_data if r["scheme_type"] == "FD"]
     mfs = [r for r in inv_data if r["scheme_type"] == "MF"]
 
+    if st.session_state.get("inv_flash"):
+        st.success(st.session_state.pop("inv_flash"))
+
+    # ── Management view: balance, gains, ROI, FD vs Mutual Fund ───────────────
+    render_investment_overview(entity_filter, as_of_date)
+
+    st.markdown("---")
+    st.markdown('<div class="section-header" style="margin:6px 0 10px;">Details &amp; Data Entry</div>',
+                unsafe_allow_html=True)
+
     # ── Import from Excel ─────────────────────────────────────────────────────
     with st.expander("📥 Import Investments from Excel", expanded=False):
         _dl_col, _up_col = st.columns([1, 2])
@@ -4286,29 +4356,66 @@ elif selected_tab == "Investments":
                 "Invested / Redeemed", ["Invested", "Redeemed"],
                 key="mi_entry_type")
 
+        _known_schemes = sorted({e["scheme_name"] for e in get_manual_investments()
+                                 if e["scheme_type"] == "MF"} |
+                                {o["scheme_name"] for o in get_opening_lots()})
+        _mi_pick = st.selectbox(
+            "Existing mutual fund scheme (optional — avoids spelling mismatches for FIFO)",
+            ["— type a new name above —"] + _known_schemes, key="mi_pick")
+
+        _mu1, _mu2 = st.columns(2)
+        with _mu1:
+            _mi_units = st.number_input(
+                "Units (mutual funds)", min_value=0.0, step=1.0, format="%.3f", key="mi_units",
+                help="Fill Units and NAV for mutual funds: the amount is calculated and a redemption is "
+                     "matched to the oldest purchases (FIFO) to give cost and capital gain.")
+        with _mu2:
+            _mi_nav = st.number_input(
+                "NAV (₹)", min_value=0.0, step=1.0, format="%.4f", key="mi_nav")
+        st.caption("Mutual funds: enter Units and NAV (Amount is then ignored). "
+                   "FDs, or entries without units: enter the Amount only.")
+
         _mi_notes = st.text_input(
             "Notes (optional)",
             placeholder="Maturity date, interest rate etc.",
             key="mi_notes")
 
         if st.form_submit_button("Save Entry"):
-            if not _mi_scheme.strip():
+            _mi_name = (_mi_pick if _mi_pick in _known_schemes and not _mi_scheme.strip()
+                        else _mi_scheme.strip())
+            _use_units = _mi_type == "MF" and _mi_units > 0 and _mi_nav > 0
+            if not _mi_name:
                 st.error("Scheme Name is required.")
-            elif _mi_amount <= 0:
+            elif _mi_type == "MF" and ((_mi_units > 0) != (_mi_nav > 0)):
+                st.error("Enter both Units and NAV (or leave both empty and enter an Amount).")
+            elif not _use_units and _mi_amount <= 0:
                 st.error("Amount must be greater than 0.")
             else:
-                add_manual_investment(
+                _new_id = add_manual_investment(
                     entry_date  = str(_mi_date),
-                    scheme_name = _mi_scheme.strip(),
+                    scheme_name = _mi_name,
                     scheme_type = _mi_type,
-                    amount      = _mi_amount,
+                    amount      = (_mi_units * _mi_nav) if _use_units else _mi_amount,
                     entry_type  = _mi_entry_type,
                     entity      = _mi_entity,
                     notes       = _mi_notes.strip(),
+                    units       = _mi_units if _use_units else None,
+                    nav         = _mi_nav if _use_units else None,
                 )
-                st.success(
-                    f"{_mi_entry_type} {fmt_inr(_mi_amount)} in "
-                    f"{_mi_scheme} ({_mi_type}) saved.")
+                _msg = (f"{_mi_entry_type} {fmt_inr(_mi_units * _mi_nav if _use_units else _mi_amount)} in "
+                        f"{_mi_name} ({_mi_type}) saved.")
+                if _use_units and _mi_entry_type == "Redeemed":
+                    _fres = compute_fifo(_mi_entity)
+                    _mine = [l for l in _fres["closed"] if l["entry_id"] == _new_id]
+                    _cost = sum(l["units_sold"] * l["purchase_nav"] for l in _mine)
+                    _proc = sum(l["units_sold"] * l["sale_nav"] for l in _mine)
+                    _short = [u for u in _fres["unmatched"] if u["entry_id"] == _new_id]
+                    _msg += (f" FIFO: matched {len(_mine)} lot(s), cost {fmt_inr(_cost)}, "
+                             f"proceeds {fmt_inr(_proc)}, capital gain {fmt_inr(_proc - _cost)}.")
+                    if _short:
+                        _msg += (f" ⚠️ {_short[0]['units_short']:,.3f} units had no matching purchase — "
+                                 f"load your open holdings under Capital gain data & setup.")
+                st.session_state["inv_flash"] = _msg
                 st.cache_data.clear()
                 st.rerun()
 
@@ -4327,7 +4434,9 @@ elif selected_tab == "Investments":
                 _me["entity"],
                 f'<b style="color:{_me_color};">'
                 f'{_me["entry_type"]}: {fmt_inr(_me["amount"])}</b>',
-                _me["notes"] or "—",
+                ((f'{_me["units"]:,.3f} units @ ₹{_me["nav"]:,.4f}'
+                  + (f' · {_me["notes"]}' if _me["notes"] else ""))
+                 if _me.get("units") else (_me["notes"] or "—")),
             ]):
                 with _col:
                     st.markdown(
@@ -4665,6 +4774,10 @@ elif selected_tab == "Upload":
         {_up_result.get('skipped',0):,} duplicates skipped
     </span>
 </div>""", unsafe_allow_html=True)
+            for _w in _up_result.get("warnings", []):
+                st.warning(f"⚠️ {_w}")
+            if not _up_result.get("warnings"):
+                st.success("✅ Data check passed for this account — no gaps, balances tie.")
         elif _up_result["status"] == "already_loaded":
             st.markdown(f"""
 <div style="background:#FFFFF0; border-left:4px solid #D69E2E;
@@ -4738,10 +4851,29 @@ elif selected_tab == "Upload":
                     date_from=_d_from,
                     date_to=_d_to,
                 )
+                # Immediately check this account for gaps / balance breaks around the new data
+                _warn = []
+                try:
+                    st.cache_data.clear()
+                    _rep = _integrity_raw()
+                    _lo = (datetime.date.fromisoformat(_d_from) - datetime.timedelta(days=7)).isoformat() if _d_from else "0000"
+                    for _m in _rep["missing"]:
+                        if _m["bank"] == _up_account and _m["to"] >= _lo:
+                            _warn.append(
+                                f"No statement loaded for {_m['from']} to {_m['to']} "
+                                f"({_m['days']} day(s)). Upload that statement too.")
+                    for _b in _rep["breaks"]:
+                        if _b["bank"] == _up_account and _b["date"] >= _lo:
+                            _warn.append(
+                                f"Balance on {_b['date']} does not tie: difference {fmt_inr(_b['diff'])} "
+                                f"({'earlier days not loaded' if _b['after_gap'] else 'some transactions missing'}).")
+                except Exception:
+                    pass
                 st.session_state["last_process_result"] = {
                     "status": "success", "filename": _uploaded_file.name,
                     "inserted": _ins, "skipped": _skp,
                     "entity": _up_entity, "bank": _up_account,
+                    "warnings": _warn,
                 }
             else:
                 # Nothing inserted — discard the reserved placeholder trail row.

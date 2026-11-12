@@ -38,7 +38,7 @@ def get_bank_closing_balance(entity, d_to, db_file=None):
             AND date <= ?
             AND balance IS NOT NULL
             {entity_clause}
-            ORDER BY date DESC, id DESC
+            ORDER BY date DESC, ord_key DESC
             LIMIT 1
         """, [bank, d_to] + entity_params).fetchone()
         if row and row["balance"] is not None:
@@ -114,7 +114,7 @@ def fetch_cf(entity, d_from, d_to, db_file, financial_year=None):
             AND balance IS NOT NULL
             AND final_group != 'OPENING BALANCE'
             {entity_clause}
-            ORDER BY date DESC, id DESC
+            ORDER BY date DESC, ord_key DESC
             LIMIT 1
         """, [bank, d_before] + entity_params).fetchone()
 

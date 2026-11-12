@@ -11,6 +11,20 @@ STATEMENTS_DIR = "statements"
 PROCESSED_DIR  = "processed"
 
 
+def _statement_positions(df):
+    """
+    Position of each row in the statement, oldest first, so the true order of
+    transactions within a day is known. Axis/HDFC statements list oldest -> newest;
+    if a file is newest-first (detected from the running balance) positions are reversed.
+    """
+    n = len(df)
+    bal, cr, dr = df["balance"].astype(float), df["credit"].astype(float), df["debit"].astype(float)
+    fwd = ((bal.shift(1) + cr - dr - bal).abs() < 0.5).sum()
+    bwd = ((bal.shift(-1) + cr - dr - bal).abs() < 0.5).sum()
+    idx = list(range(1, n + 1))
+    return idx[::-1] if bwd > fwd else idx
+
+
 def process_file(filepath, keywords=None, entity=None, bank=None, delete_after=False,
                   upload_id=None):
     """Full pipeline: read -> categorize -> save -> archive (or delete if delete_after=True).
@@ -45,6 +59,8 @@ def process_file(filepath, keywords=None, entity=None, bank=None, delete_after=F
 
     if upload_id is not None:
         df["upload_id"] = upload_id
+    df = df.reset_index(drop=True)
+    df["stmt_seq"] = _statement_positions(df)
     records = df.to_dict("records")
     inserted, skipped = insert_transactions(records)
     print(f"[DB] Inserted: {inserted} | Skipped duplicates: {skipped}")
