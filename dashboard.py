@@ -23,7 +23,7 @@ from database import (
     delete_cash_entry, import_cash_excel,
     get_investment_transactions, tag_investment_transaction,
     get_investment_movements, get_investment_events, get_daywise_totals,
-    get_data_integrity_report, get_opening_lots, compute_fifo,
+    get_data_integrity_report, get_opening_lots, compute_fifo, repair_order_keys,
     add_manual_investment, get_manual_investments,
     delete_manual_investment, get_manual_investment_totals,
     get_entity_closing_balance, get_summary_with_bank,
@@ -2744,6 +2744,22 @@ elif selected_tab == "Exception Report":
     st.caption("Checks that every statement day is loaded and that each day's closing balance "
                "equals the previous closing + credits − debits, using the balance printed by the bank.")
     _ig = get_data_integrity_report()
+    if _ig["breaks"]:
+        _rc1, _rc2 = st.columns([1.3, 4])
+        with _rc1:
+            if st.button("🔧 Re-check balance order", key="repair_order_btn",
+                         help="Re-derives each day's transaction order from the bank's running balance. "
+                              "Safe to run; fixes wrong day-end balances."):
+                with st.spinner("Re-checking..."):
+                    _rs = repair_order_keys()
+                st.cache_data.clear()
+                st.session_state["repair_msg"] = (
+                    f"Checked {_rs['days']:,} account-days: {_rs['reordered']:,} re-ordered, "
+                    f"{_rs['unresolved']:,} could not be resolved (rows missing).")
+                st.rerun()
+        with _rc2:
+            if st.session_state.get("repair_msg"):
+                st.caption(st.session_state.pop("repair_msg"))
     if not _ig["missing"] and not _ig["breaks"]:
         st.success("All clear — no missing statement dates and every balance ties.")
     if _ig["missing"]:

@@ -107,6 +107,9 @@ def init_db():
     except Exception:
         pass
 
+    conn.execute("CREATE TABLE IF NOT EXISTS app_flags (name TEXT PRIMARY KEY, value TEXT)")
+    conn.commit()
+
     # Backfill financial_year for any rows that don't have it yet
     conn.execute("""
         UPDATE transactions
@@ -361,6 +364,16 @@ def init_db():
             pass
     conn.commit()
 
+    # One-time: fix day-end ordering everywhere from the balance chain (see repair_order_keys)
+    if not conn.execute("SELECT 1 FROM app_flags WHERE name='order_repair_v2'").fetchone():
+        conn.close()
+        _stats = repair_order_keys()
+        conn = get_connection()
+        conn.execute("INSERT OR REPLACE INTO app_flags (name, value) VALUES ('order_repair_v2', ?)",
+                     [str(_stats)])
+        conn.commit()
+        print(f"[DB] Order repair: {_stats}")
+
     conn.close()
     print("[DB] Database initialized.")
 
@@ -389,6 +402,108 @@ def make_fingerprint(entity, bank, date, narration, debit, credit, occurrence=0)
     if occurrence:
         raw += f"|#{occurrence}"
     return hashlib.md5(raw.encode()).hexdigest()
+
+
+def _chain_order(rows):
+    """
+    Put a day's rows in true bank order using the running balance printed on each row.
+    Each row is an edge  (balance before) -> (balance after);  the day is one continuous
+    path through those balances (an Eulerian path), found with Hierholzer's algorithm.
+    Where several orders are equally valid (e.g. +100 then -100), the file/load order
+    (`hint`) is preferred; the day's closing balance is the same either way.
+    rows: list of (id, hint, debit, credit, balance).
+    Returns the ids in order, or None when no single path covers every row
+    (rows of that day are missing) — callers then leave the order unchanged.
+    """
+    n = len(rows)
+    if n <= 1:
+        return [r[0] for r in rows]
+    bal = [int(round(r[4] * 100)) for r in rows]
+    pre = [int(round((r[4] - r[3] + r[2]) * 100)) for r in rows]
+    out_d, in_d, adj = {}, {}, {}
+    for i in sorted(range(n), key=lambda k: (rows[k][1], rows[k][0]), reverse=True):
+        adj.setdefault(pre[i], []).append(i)            # pop() yields the lowest hint first
+    for i in range(n):
+        out_d[pre[i]] = out_d.get(pre[i], 0) + 1
+        in_d[bal[i]] = in_d.get(bal[i], 0) + 1
+    nodes = set(out_d) | set(in_d)
+    starts = [v for v in nodes if out_d.get(v, 0) - in_d.get(v, 0) == 1]
+    ends = [v for v in nodes if in_d.get(v, 0) - out_d.get(v, 0) == 1]
+    if (any(abs(out_d.get(v, 0) - in_d.get(v, 0)) > 1 for v in nodes)
+            or len(starts) > 1 or len(ends) > 1 or len(starts) != len(ends)):
+        return None
+    if starts:
+        s = starts[0]
+    else:                                   # closed loop (zero net movement): start at the first-hinted row
+        s = pre[min(range(n), key=lambda k: (rows[k][1], rows[k][0]))]
+    stack, path = [(s, None)], []
+    while stack:
+        v, e = stack[-1]
+        if adj.get(v):
+            j = adj[v].pop()
+            stack.append((bal[j], j))
+        else:
+            stack.pop()
+            if e is not None:
+                path.append(e)
+    path.reverse()
+    if len(path) != n:
+        return None
+    return [rows[i][0] for i in path]
+
+
+def _repair_day(c, bank, date):
+    """Re-order one account-day by its balance chain. Returns True if the chain was complete."""
+    rows = c.execute(
+        "SELECT id, COALESCE(ord_key, id) AS hint, debit, credit, balance FROM transactions "
+        "WHERE bank=? AND date=? AND final_group != 'OPENING BALANCE' AND balance IS NOT NULL",
+        [bank, date]).fetchall()
+    rows = [(r[0], r[1], r[2] or 0.0, r[3] or 0.0, r[4]) for r in rows]
+    order = _chain_order(rows)
+    if order is None:
+        return False
+    current = [r[0] for r in sorted(rows, key=lambda r: (r[1], r[0]))]
+    if order != current:
+        c.executemany("UPDATE transactions SET ord_key=? WHERE id=?",
+                      [(pos, rid) for pos, rid in enumerate(order, 1)])
+    return True
+
+
+def repair_order_keys(since=None):
+    """
+    Re-derive the within-day order of every account-day from the balance chain
+    (fixes day-end balances picked from the wrong row). Safe to re-run.
+    Returns {"days": n, "reordered": n, "unresolved": n}.
+    """
+    conn = get_connection()
+    c = conn.cursor()
+    where = "WHERE final_group != 'OPENING BALANCE' AND balance IS NOT NULL"
+    params = []
+    if since:
+        where += " AND date >= ?"
+        params.append(since)
+    days = c.execute(
+        f"SELECT bank, date FROM transactions {where} GROUP BY bank, date HAVING COUNT(*) > 1",
+        params).fetchall()
+    stats = {"days": len(days), "reordered": 0, "unresolved": 0}
+    for bank, date in days:
+        before = c.execute(
+            "SELECT group_concat(id) FROM (SELECT id FROM transactions WHERE bank=? AND date=? "
+            "AND final_group != 'OPENING BALANCE' AND balance IS NOT NULL "
+            "ORDER BY COALESCE(ord_key, id), id)", [bank, date]).fetchone()[0]
+        ok = _repair_day(c, bank, date)
+        if not ok:
+            stats["unresolved"] += 1
+            continue
+        after = c.execute(
+            "SELECT group_concat(id) FROM (SELECT id FROM transactions WHERE bank=? AND date=? "
+            "AND final_group != 'OPENING BALANCE' AND balance IS NOT NULL "
+            "ORDER BY COALESCE(ord_key, id), id)", [bank, date]).fetchone()[0]
+        if before != after:
+            stats["reordered"] += 1
+    conn.commit()
+    conn.close()
+    return stats
 
 
 def insert_transactions(rows):
@@ -451,17 +566,11 @@ def insert_transactions(rows):
     # New rows take their load order as ord_key (same as id)
     c.execute("UPDATE transactions SET ord_key = id WHERE ord_key IS NULL")
 
-    # If this statement contains EVERY row now stored for a day, it is authoritative for
-    # that day's order: re-stamp all of the day's rows (new and already-loaded) with the
-    # statement's own row order. Partial statements leave the order untouched.
-    for (bank, date), items in day_rows.items():
-        stored = c.execute(
-            "SELECT COUNT(*) FROM transactions "
-            "WHERE bank=? AND date=? AND final_group != 'OPENING BALANCE'",
-            [bank, date]).fetchone()[0]
-        if stored == len(items):
-            c.executemany("UPDATE transactions SET ord_key=? WHERE fingerprint=?",
-                          [(seq, fp) for fp, seq in items])
+    # Within-day order comes from the bank's running balance, so it does not depend on how the
+    # file happened to be sorted. If a day's chain cannot be completed (rows missing) its order
+    # is left as it was: existing rows keep their order, new rows follow in load order.
+    for (bank, date) in day_rows:
+        _repair_day(c, bank, date)
 
     conn.commit()
     conn.close()
