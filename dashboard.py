@@ -24,6 +24,7 @@ from database import (
     get_investment_transactions, tag_investment_transaction,
     get_investment_movements, get_investment_events, get_daywise_totals,
     get_data_integrity_report, get_opening_lots, compute_fifo, repair_order_keys,
+    find_duplicate_rows, remove_duplicate_rows,
     add_manual_investment, get_manual_investments,
     delete_manual_investment, get_manual_investment_totals,
     get_entity_closing_balance, get_summary_with_bank,
@@ -130,7 +131,7 @@ for _fn_name in (
     "get_investment_transactions", "get_investment_summary",
     "get_uncategorized", "get_missing_statements", "get_large_debits",
     "get_transfer_reconciliation", "get_upload_trail", "get_category_audit",
-    "fetch_cf", "get_mf_fd_cash_asof", "get_daywise_totals", "get_data_integrity_report",
+    "fetch_cf", "get_mf_fd_cash_asof", "get_daywise_totals", "get_data_integrity_report", "find_duplicate_rows",
 ):
     globals()[_fn_name] = st.cache_data(ttl=300, show_spinner=False)(globals()[_fn_name])
 from tabs.overview import render_overview
@@ -2745,6 +2746,28 @@ elif selected_tab == "Exception Report":
                "equals the previous closing + credits − debits, using the balance printed by the bank.")
     _ig = get_data_integrity_report()
     if _ig["breaks"]:
+        _dups = find_duplicate_rows()
+        if _dups["ids"]:
+            st.warning(
+                f"🧹 **{len(_dups['ids'])} duplicate transaction rows** found on {_dups['days']} day(s): the same "
+                f"transaction (same account, date, amount and balance) is stored twice, usually because the bank "
+                f"worded the narration differently in two downloads (e.g. “CSH/CB” vs “CSH-CB”). "
+                f"They inflate that day's credits/debits and cause balance mismatches. "
+                f"New uploads no longer create them; this removes the ones already stored.")
+            with st.expander("Show the duplicate rows"):
+                _dd = pd.DataFrame(_dups["rows"])
+                _dd["debit"] = _dd["debit"].apply(fmt_inr)
+                _dd["credit"] = _dd["credit"].apply(fmt_inr)
+                st.dataframe(_dd.rename(columns={"id": "Row ID", "bank": "Account", "date": "Date",
+                                                 "narration": "Narration", "debit": "Debit", "credit": "Credit",
+                                                 "upload_id": "Upload #"}),
+                             use_container_width=True, hide_index=True,
+                             column_config=amount_config(["Debit", "Credit"]))
+            if st.button(f"🧹 Remove {len(_dups['ids'])} duplicate rows", key="remove_dups_btn"):
+                _n_del = remove_duplicate_rows(_dups["ids"])
+                st.cache_data.clear()
+                st.session_state["repair_msg"] = f"Removed {_n_del} duplicate rows."
+                st.rerun()
         _rc1, _rc2 = st.columns([1.3, 4])
         with _rc1:
             if st.button("🔧 Re-check balance order", key="repair_order_btn",

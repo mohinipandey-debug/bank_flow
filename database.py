@@ -507,61 +507,104 @@ def repair_order_keys(since=None):
 
 
 def insert_transactions(rows):
+    """
+    Insert statement rows, skipping rows that are already stored.
+
+    A row already exists when the same account has a row with the same date, debit, credit
+    AND running balance — the narration text is deliberately not part of the test, because the
+    bank words the same transaction differently between exports (e.g. 'CSH/CB' vs 'CSH-CB',
+    '06/03/2026' vs '06-03-2026'). The running balance tells genuine repeats apart: two
+    identical cheques on one day have different balances, so both are kept.
+    Rows with no balance fall back to the old narration-based fingerprint.
+    """
+    from collections import Counter
     conn = get_connection()
     c = conn.cursor()
     inserted = 0
     skipped  = 0
-    seen_in_batch = {}      # identical-row counter within this statement
-    day_rows = {}           # (bank, date) -> [(fingerprint, statement position)]
+    seen_in_batch = {}      # fallback occurrence counter (rows without a balance)
+    day_rows = {}           # (bank, date) pairs touched by this statement
+
+    # What is already stored for the banks / dates this statement covers
+    existing = Counter()
+    _banks = sorted({r["bank"] for r in rows})
+    _dates = sorted({r["date"] for r in rows if r.get("final_group") != "OPENING BALANCE"})
+    if _banks and _dates:
+        qmarks = ",".join("?" * len(_banks))
+        for er in c.execute(
+                f"SELECT bank, date, debit, credit, balance FROM transactions "
+                f"WHERE bank IN ({qmarks}) AND date BETWEEN ? AND ? "
+                f"AND final_group != 'OPENING BALANCE' AND balance IS NOT NULL",
+                _banks + [_dates[0], _dates[-1]]).fetchall():
+            existing[(er[0], er[1], round(er[2] or 0, 2), round(er[3] or 0, 2), round(er[4], 2))] += 1
 
     for row in rows:
         # Skip duplicate Opening Balance rows — keep only first per bank
         if row.get("final_group") == "OPENING BALANCE":
-            existing = c.execute("""
+            ob_exists = c.execute("""
                 SELECT COUNT(*) FROM transactions
                 WHERE bank = ? AND final_group = 'OPENING BALANCE'
             """, [row["bank"]]).fetchone()[0]
-            if existing > 0:
+            if ob_exists > 0:
                 skipped += 1
                 print(f"[OB] Skipping duplicate OB for {row['bank']}")
+                continue
+
+        bal = row.get("balance")
+        if bal is not None:
+            k2 = (row["bank"], row["date"], round(row["debit"] or 0, 2),
+                  round(row["credit"] or 0, 2), round(bal, 2))
+            if existing[k2] > 0:
+                existing[k2] -= 1
+                skipped += 1                      # already stored (whatever its narration says)
                 continue
 
         _key = (row["entity"], row["bank"], row["date"],
                 row["narration"], row["debit"], row["credit"])
         _occ = seen_in_batch.get(_key, 0)
         seen_in_batch[_key] = _occ + 1
-        fp = make_fingerprint(*_key, occurrence=_occ)
         fy = _date_to_fy(row["date"])
-        if row.get("stmt_seq") is not None and row.get("final_group") != "OPENING BALANCE":
-            day_rows.setdefault((row["bank"], row["date"]), []).append(
-                (fp, int(row["stmt_seq"])))
-        try:
-            c.execute("""
-                INSERT INTO transactions
-                (fingerprint, entity, bank, date, narration,
-                 debit, credit, balance, category, final_group,
-                 group_name, main_group, source_file, manually_overridden,
-                 financial_year, upload_id)
-                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-            """, (
-                fp,
-                row["entity"], row["bank"], row["date"], row["narration"],
-                row["debit"], row["credit"], row.get("balance"),
-                row.get("category")    or "Uncategorized",
-                row.get("final_group") or "Uncategorized",
-                row.get("group_name")  or "",
-                row.get("main_group")  or "",
-                row.get("source_file"),
-                int(row.get("manually_overridden", 0)),
-                fy,
-                row.get("upload_id"),
-            ))
-            inserted += 1
-        except sqlite3.IntegrityError:
-            skipped += 1   # duplicate fingerprint — expected
-        except Exception as exc:
+        if row.get("final_group") != "OPENING BALANCE":
+            day_rows[(row["bank"], row["date"])] = True
+
+        # unique fingerprint: plain, then with the balance, then with a counter
+        fps = [make_fingerprint(*_key, occurrence=_occ)]
+        if bal is not None:
+            base = make_fingerprint(*_key)
+            fps = [base, f"{base}|b{bal:.2f}"] + [f"{base}|b{bal:.2f}|{n}" for n in range(1, 6)]
+        done = False
+        for fp in fps:
+            try:
+                c.execute("""
+                    INSERT INTO transactions
+                    (fingerprint, entity, bank, date, narration,
+                     debit, credit, balance, category, final_group,
+                     group_name, main_group, source_file, manually_overridden,
+                     financial_year, upload_id)
+                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                """, (
+                    fp,
+                    row["entity"], row["bank"], row["date"], row["narration"],
+                    row["debit"], row["credit"], bal,
+                    row.get("category")    or "Uncategorized",
+                    row.get("final_group") or "Uncategorized",
+                    row.get("group_name")  or "",
+                    row.get("main_group")  or "",
+                    row.get("source_file"),
+                    int(row.get("manually_overridden", 0)),
+                    fy,
+                    row.get("upload_id"),
+                ))
+                inserted += 1
+                done = True
+                break
+            except sqlite3.IntegrityError:
+                continue        # fingerprint taken — try the next, more specific one
+            except Exception as exc:
+                print(f"[DB] ERROR inserting row ({row.get('bank')} {row.get('date')}): {exc}")
+                break
+        if not done:
             skipped += 1
-            print(f"[DB] ERROR inserting row ({row.get('bank')} {row.get('date')}): {exc}")
 
     # New rows take their load order as ord_key (same as id)
     c.execute("UPDATE transactions SET ord_key = id WHERE ord_key IS NULL")
@@ -575,6 +618,81 @@ def insert_transactions(rows):
     conn.commit()
     conn.close()
     return inserted, skipped
+
+
+def _chain_defect(rows):
+    """0 when the day's balances form one unbroken chain; larger = more breaks."""
+    out_d, in_d = {}, {}
+    for r in rows:
+        pre = int(round((r[4] - r[3] + r[2]) * 100))
+        post = int(round(r[4] * 100))
+        out_d[pre] = out_d.get(pre, 0) + 1
+        in_d[post] = in_d.get(post, 0) + 1
+    imb = sum(abs(out_d.get(v, 0) - in_d.get(v, 0)) for v in set(out_d) | set(in_d))
+    return max(0, (imb - 2) // 2)
+
+
+def find_duplicate_rows(since="2026-04-01"):
+    """
+    Rows stored twice because the same transaction arrived with different narration wording:
+    same account, date, debit, credit AND running balance. A group is only reported when the
+    day's balance chain confirms it — i.e. removing the extra copy makes the day's balances
+    tie better. (A genuine repeat, like +100 / -100 / +100, keeps the chain intact and is left alone.)
+    Only the live statement period (from `since`) is examined: the FY2025-26 Excel import has no
+    reliable day-level balances.
+    Returns {"ids": [extra row ids], "days": n, "rows": [...]}.
+    """
+    from collections import defaultdict
+    conn = get_connection()
+    rows = conn.execute(
+        "SELECT id, bank, date, debit, credit, balance, narration, upload_id FROM transactions "
+        "WHERE final_group != 'OPENING BALANCE' AND balance IS NOT NULL AND date >= ?",
+        [since]).fetchall()
+    conn.close()
+    by_day = defaultdict(list)
+    for r in rows:
+        by_day[(r["bank"], r["date"])].append(r)
+
+    confirmed, details, days = [], [], 0
+    for (bank, date), rs in by_day.items():
+        groups = defaultdict(list)
+        for r in rs:
+            groups[(round(r["debit"] or 0, 2), round(r["credit"] or 0, 2), round(r["balance"], 2))].append(r)
+        extras = []
+        for g in groups.values():
+            if len(g) > 1:
+                g = sorted(g, key=lambda x: x["id"])
+                extras.extend(g[1:])
+        if not extras:
+            continue
+        tup = lambda x: (x["id"], x["id"], x["debit"] or 0.0, x["credit"] or 0.0, x["balance"])
+        before = _chain_defect([tup(r) for r in rs])
+        drop = {e["id"] for e in extras}
+        after = _chain_defect([tup(r) for r in rs if r["id"] not in drop])
+        if after < before:
+            days += 1
+            confirmed.extend(sorted(drop))
+            for e in extras:
+                details.append({"id": e["id"], "bank": bank, "date": date, "narration": e["narration"],
+                                "debit": e["debit"], "credit": e["credit"], "upload_id": e["upload_id"]})
+    return {"ids": confirmed, "days": days, "rows": details}
+
+
+def remove_duplicate_rows(ids):
+    """Delete the given duplicate rows (ids from find_duplicate_rows) and re-order the affected days."""
+    if not ids:
+        return 0
+    conn = get_connection()
+    c = conn.cursor()
+    marks = ",".join("?" * len(ids))
+    days = c.execute(f"SELECT DISTINCT bank, date FROM transactions WHERE id IN ({marks})", ids).fetchall()
+    c.execute(f"DELETE FROM transactions WHERE id IN ({marks})", ids)
+    deleted = c.rowcount
+    for bank, date in days:
+        _repair_day(c, bank, date)
+    conn.commit()
+    conn.close()
+    return deleted
 
 
 def mark_file_processed(filepath, entity, bank, row_count):
