@@ -137,6 +137,7 @@ for _fn_name in (
 from tabs.overview import render_overview
 from tabs.review_queue import render_review_queue
 from tabs.investment_overview import render_investment_overview, render_investment_header
+from tabs.cashflow_statement_view import render_cashflow_statement
 
 # ── Live-view badge — shown in tabs that are NOT filtered by FY ───────────────
 
@@ -3192,13 +3193,7 @@ elif selected_tab == "Cash Flow":
         week_anchor = datetime.date.fromisoformat(
             get_latest_data_date() or str(datetime.date.today()))
 
-    # ── View toggle: Monthly vs Weekly ────────────────────────────────────────
-    cf_view = st.radio(
-        "View", ["Monthly", "Weekly"],
-        horizontal=True, key="cf_view_toggle", label_visibility="collapsed"
-    )
-
-    # ── Expand / Collapse All ─────────────────────────────────────────────────
+    # ── View toggle + Expand / Collapse All (one row) ─────────────────────────
     # Match section toggles (_open suffix) and group toggles (_grp_ in key)
     # but NOT widget keys like cf_ent_radio / cf_from / cf_to.
     def _cf_toggle_keys():
@@ -3208,7 +3203,17 @@ elif selected_tab == "Cash Flow":
             and ("_open" in k or "_grp_" in k)
         ]
 
-    _ea_col, _ca_col, _ = st.columns([1.7, 1.7, 6.6])
+    _vc1, _vc2, _ea_col, _ca_col, _ = st.columns([2, 4.2, 1.7, 1.7, 1.4])
+    with _vc1:
+        cf_view = st.radio(
+            "View", ["Monthly", "Weekly"],
+            horizontal=True, key="cf_view_toggle", label_visibility="collapsed"
+        )
+    with _vc2:
+        cf_fmt = st.radio(
+            "Format", ["Companies Act format", "Previous format"],
+            horizontal=True, key="cf_fmt_toggle", label_visibility="collapsed"
+        )
     with _ea_col:
         if st.button("⊞ Expand All", key="cf_expand_all"):
             for _k in _cf_toggle_keys():
@@ -3273,7 +3278,10 @@ elif selected_tab == "Cash Flow":
     # ─────────────────────────────────────────────────────────────────────────
     # MONTHLY VIEW
     # ─────────────────────────────────────────────────────────────────────────
-    if cf_view == "Monthly":
+    if cf_fmt == "Companies Act format":
+        render_cashflow_statement(cf_view, cf_entity, cf_month_from, cf_month_to, week_anchor)
+
+    elif cf_view == "Monthly":
         _fmt_d = lambda d: datetime.date.fromisoformat(str(d)).strftime("%d %b %Y")
         st.markdown(f"""
 <div class="cf-stmt-head">

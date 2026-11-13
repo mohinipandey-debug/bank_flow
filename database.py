@@ -12,6 +12,84 @@ def get_connection():
     return conn
 
 
+# ── Cash-flow classification (Operating / Investing / Financing) ─────────────
+# One row per transaction category (final_group). The Cash Flow statement reads this table,
+# so a category can be re-classified by editing its row — no code change, and transactions are
+# never touched. Each line is NET (credits - debits) of its categories, so refunds / bounce-backs
+# reduce the same line they came from.  'Pending review' lines are always shown, never hidden.
+#   flow_type: 'cash'     normal bank flow
+#              'internal' moves money inside the reporting perimeter (nets to zero)
+#              'derived'  cash deposits: operating inflow = deposits + change in Cash at Stores
+_CF_MAP_SEED = [
+    # category,                        activity,   bucket,                    sub_bucket,                  flow_type
+    ("PAYTM",                         "Operating", "Customer receipts",       "PAYTM collections",         "cash"),
+    ("RAZORPAY",                      "Operating", "Customer receipts",       "Razorpay collections",      "cash"),
+    ("CC-CMS",                        "Operating", "Customer receipts",       "Card / CMS collections",    "cash"),
+    ("Cash Deposit",                  "Operating", "Customer receipts",       "Cash deposited in banks", "derived"),
+    ("SIS INCOME",                    "Operating", "Other operating income",  "SIS income",                "cash"),
+    ("Other Income",                  "Operating", "Other operating income",  "Other income",              "cash"),
+    ("Income tax",                    "Operating", "Statutory payments",      "Income tax",                "cash"),
+    ("Statuatory Payment",            "Operating", "Statutory payments",      "Statutory payments",        "cash"),
+    ("Sundry Creditors-Apparels",     "Operating", "Supplier payments",       "Apparel creditors",         "cash"),
+    ("Sundry Creditors for Expenses", "Operating", "Supplier payments",       "Expense creditors",         "cash"),
+    ("Sundry Creditors-GM",           "Operating", "Supplier payments",       "GM creditors",              "cash"),
+    ("Cheques",                       "Operating", "Supplier payments",       "Cheque payments to vendors", "cash"),
+    ("Salary",                        "Operating", "Employee costs",          "Salary",                    "cash"),
+    ("Staff Welfare",                 "Operating", "Employee costs",          "Staff welfare",             "cash"),
+    ("Rent",                          "Operating", "Rent",               "Rent",                      "cash"),
+    ("Rent Expense",                  "Operating", "Rent",               "Rent",                      "cash"),
+    ("Power and Fuel Expenses",       "Operating", "Store operating expenses", "Power and fuel",           "cash"),
+    ("Travelling & Conveyance Expenses", "Operating", "Store operating expenses", "Travel and conveyance", "cash"),
+    ("Legal and Professional Expenses", "Operating", "Store operating expenses", "Legal and professional", "cash"),
+    ("Miscellaneous Expenses",        "Operating", "Store operating expenses", "Miscellaneous expenses",   "cash"),
+    ("Freight Outward",               "Operating", "Store operating expenses", "Freight outward",          "cash"),
+    ("Insurance",                     "Operating", "Store operating expenses", "Insurance",                "cash"),
+    ("Security expenses",             "Operating", "Store operating expenses", "Security expenses",        "cash"),
+    ("Communication",                 "Operating", "Store operating expenses", "Communication",            "cash"),
+    ("Bank Charges",                  "Operating", "Bank charges",           "Bank charges",              "cash"),
+    ("Sundry Creditors-Non Trading",  "Investing", "Capital expenditure",     "Non-trading assets",        "cash"),
+    ("Fixed Assets",                  "Investing", "Capital expenditure",     "Fixed assets",              "cash"),
+    ("SECURITY DEPOSIT",              "Investing", "Security deposits",       "Security deposits",         "cash"),
+    ("Interest income",               "Investing", "Investment income",       "Interest received",         "cash"),
+    ("INVESTMENT",                    "Investing", "Treasury investments",    "MF / FD (split by scheme type)", "cash"),
+    ("Mutual Fund",                   "Investing", "Treasury investments",    "Mutual funds",              "cash"),
+    ("FIXED DEPOSIT",                 "Investing", "Treasury investments",    "Fixed deposits",            "cash"),
+    ("Vehicle Loan",                  "Financing", "Vehicle loan repayment",              "Vehicle loan repayment",    "cash"),
+    ("Finance Cost",                  "Financing", "Finance costs",           "Finance costs",             "cash"),
+    ("Interest on OD",                "Financing", "Finance costs",           "OD interest",               "cash"),
+    ("INTERCOMPANY TRANSFER",         "Financing", "Intercompany funding",    "Intercompany transfers",    "internal"),
+    ("INTERBANK TRANSFER",            "Internal",  "Internal movements",      "Interbank transfer",        "internal"),
+    ("Return",                        "Pending review", "Pending review",     "Returns received",          "cash"),
+    ("Uncategorized",                 "Pending review", "Pending review",     "Uncategorised",             "cash"),
+]
+
+
+def _ensure_cashflow_map(conn):
+    """Create the classification table and add any seed rows that are missing (never overwrites edits)."""
+    conn.execute("""CREATE TABLE IF NOT EXISTS cashflow_map (
+        category TEXT PRIMARY KEY, activity TEXT NOT NULL, bucket TEXT NOT NULL,
+        sub_bucket TEXT NOT NULL, flow_type TEXT NOT NULL DEFAULT 'cash')""")
+    conn.executemany(
+        "INSERT OR IGNORE INTO cashflow_map (category, activity, bucket, sub_bucket, flow_type) VALUES (?,?,?,?,?)",
+        _CF_MAP_SEED)
+    # one-time renames of earlier labels (idempotent)
+    for old, new in (("Occupancy", "Rent"), ("Banking costs", "Bank charges"), ("Borrowings", "Vehicle loan repayment")):
+        conn.execute("UPDATE cashflow_map SET bucket=? WHERE bucket=?", (new, old))
+    conn.execute("UPDATE cashflow_map SET sub_bucket='Cash deposited in banks' "
+                 "WHERE sub_bucket='Cash sales (deposits + change in store cash)'")
+
+
+def get_cashflow_map():
+    """{category: {activity, bucket, sub_bucket, flow_type}} — categories not listed are 'Pending review'."""
+    conn = get_connection()
+    _ensure_cashflow_map(conn)
+    conn.commit()
+    rows = conn.execute("SELECT * FROM cashflow_map").fetchall()
+    conn.close()
+    return {r["category"]: {"activity": r["activity"], "bucket": r["bucket"],
+                            "sub_bucket": r["sub_bucket"], "flow_type": r["flow_type"]} for r in rows}
+
+
 def init_db():
     conn = get_connection()
     c = conn.cursor()
@@ -108,6 +186,8 @@ def init_db():
         pass
 
     conn.execute("CREATE TABLE IF NOT EXISTS app_flags (name TEXT PRIMARY KEY, value TEXT)")
+    conn.commit()
+    _ensure_cashflow_map(conn)
     conn.commit()
 
     # Backfill financial_year for any rows that don't have it yet
