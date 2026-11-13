@@ -136,7 +136,7 @@ for _fn_name in (
     globals()[_fn_name] = st.cache_data(ttl=300, show_spinner=False)(globals()[_fn_name])
 from tabs.overview import render_overview
 from tabs.review_queue import render_review_queue
-from tabs.investment_overview import render_investment_overview
+from tabs.investment_overview import render_investment_overview, render_investment_header
 
 # ── Live-view badge — shown in tabs that are NOT filtered by FY ───────────────
 
@@ -1886,12 +1886,12 @@ stores_cash_asof   = get_cash_asof("Stores",   as_of_date)
 ventures_cash_asof = get_cash_asof("Ventures", as_of_date)
 
 # Investments displayed in banner now includes cash
-stores_investments_display   = stores_inv_asof + stores_cash_asof
-ventures_investments_display = ventures_inv_asof + ventures_cash_asof
+stores_investments_display   = stores_inv_asof
+ventures_investments_display = ventures_inv_asof
 
 total_cash_position = (stores_bank_asof + ventures_bank_asof +
-                       stores_investments_display +
-                       ventures_investments_display)
+                       stores_investments_display + ventures_investments_display +
+                       stores_cash_asof + ventures_cash_asof)
 
 as_of_display = datetime.date.fromisoformat(as_of_date).strftime("%d %b %Y")
 
@@ -2011,7 +2011,7 @@ st.markdown(f"""
                 As on {as_of_display}
             </div>
         </div>
-        <div style="flex-grow:1; max-width:480px;">
+        <div style="flex-grow:1; max-width:560px;">
             <table style="width:100%; border-collapse:collapse;">
                 <tr style="border-bottom:1px solid rgba(255,255,255,0.15);">
                     <td style="padding:4px 12px 6px 0; color:#8896A5;
@@ -2021,10 +2021,14 @@ st.markdown(f"""
                         font-size:11px; font-weight:700;
                         text-transform:uppercase; text-align:right;">
                         Bank Balance</td>
-                    <td style="padding:4px 0 6px 0; color:#8896A5;
+                    <td style="padding:4px 12px 6px 0; color:#8896A5;
                         font-size:11px; font-weight:700;
                         text-transform:uppercase; text-align:right;">
                         Investments</td>
+                    <td style="padding:4px 0 6px 0; color:#8896A5;
+                        font-size:11px; font-weight:700;
+                        text-transform:uppercase; text-align:right;">
+                        Cash at Stores</td>
                 </tr>
                 <tr>
                     <td style="padding:6px 12px 6px 0; color:#FFFFFF;
@@ -2032,9 +2036,12 @@ st.markdown(f"""
                     <td style="padding:6px 12px 6px 0; color:#FFFFFF;
                         font-size:14px; font-weight:700; text-align:right;">
                         {fmt_cr(stores_bank_asof)}</td>
-                    <td style="padding:6px 0; color:#93C5FD;
+                    <td style="padding:6px 12px 6px 0; color:#93C5FD;
                         font-size:14px; font-weight:700; text-align:right;">
                         {fmt_cr(stores_investments_display)}</td>
+                    <td style="padding:6px 0; color:#67E8F9;
+                        font-size:14px; font-weight:700; text-align:right;">
+                        {fmt_cr(stores_cash_asof)}</td>
                 </tr>
                 <tr>
                     <td style="padding:6px 12px 0 0; color:#FFFFFF;
@@ -2042,9 +2049,12 @@ st.markdown(f"""
                     <td style="padding:6px 12px 0 0; color:#FFFFFF;
                         font-size:14px; font-weight:700; text-align:right;">
                         {fmt_cr(ventures_bank_asof)}</td>
-                    <td style="padding:6px 0 0 0; color:#93C5FD;
+                    <td style="padding:6px 12px 0 0; color:#93C5FD;
                         font-size:14px; font-weight:700; text-align:right;">
                         {fmt_cr(ventures_investments_display)}</td>
+                    <td style="padding:6px 0 0 0; color:#67E8F9;
+                        font-size:14px; font-weight:700; text-align:right;">
+                        {fmt_cr(ventures_cash_asof)}</td>
                 </tr>
             </table>
         </div>
@@ -2155,11 +2165,47 @@ if selected_tab == "Summary":
     _acct_balances = get_account_balances_asof(
         as_of_date, abs_entity_filter, abs_bank_filter)
 
+    _ABS_COLS = [2, 1.5, 2.6, 1.1, 2]
+    _fmt_d = lambda x: datetime.date.fromisoformat(str(x)[:10]).strftime("%d %b %Y")
+
+    def _abs_inv_rows(entity_name, as_of):
+        """Per-scheme FD / MF balances (at cost) as on `as_of`, with the date(s) money went in."""
+        ev = pd.DataFrame(get_investment_events(entity_name))
+        out = {"FD": [], "MF": []}
+        if ev.empty:
+            return out
+        ev = ev[ev["date"].isna() | (ev["date"] <= as_of)]
+        if "opening_date" not in ev.columns:
+            ev["opening_date"] = None
+        for (stype, name), g in ev.groupby(["scheme_type", "scheme_name"]):
+            if stype not in out:
+                continue
+            bal = g["delta"].sum()
+            op = g[g["source"] == "Opening"]
+            dates = []
+            if not op.empty and op["delta"].sum() > 0:
+                od = op["opening_date"].dropna()
+                dates.append((od.iloc[0] if len(od) else None, "opening"))
+            for _, r in g[(g["source"] != "Opening") & (g["delta"] > 0)].iterrows():
+                dates.append((r["date"], "invested"))
+            dts = sorted({d for d, _ in dates if d})
+            if not dts:
+                label = "—"
+            else:
+                label = _fmt_d(dts[0]) + (f" +{len(dts) - 1} more" if len(dts) > 1 else "")
+                if len(dts) == 1 and dates and dates[0][1] == "opening":
+                    label += " (opening)"
+            if abs(bal) >= 1:
+                out[stype].append({"name": name, "balance": bal, "date": label})
+        for k in out:
+            out[k].sort(key=lambda r: -r["balance"])
+        return out
+
     def _render_entity_subtotal(entity_name, entity_bank_total, rows,
                                  show_investments, as_of_date):
         _pill_cls = "abs-stores" if entity_name == "Stores" else "abs-ventures"
         for acc in rows:
-            rcols = st.columns([2, 1.5, 1.5, 1, 2])
+            rcols = st.columns(_ABS_COLS)
             _vals = [
                 f'<span class="abs-pill {_pill_cls}">{entity_name}</span>',
                 acc["bank"],
@@ -2173,22 +2219,27 @@ if selected_tab == "Summary":
 
         entity_total = entity_bank_total
         if show_investments:
-            _inv = get_entity_investment_asof(entity_name, as_of_date)
-            if _inv:
-                ircols = st.columns([2, 1.5, 1.5, 1, 2])
+            _inv_rows = _abs_inv_rows(entity_name, as_of_date)
+            for _stype, _tlabel, _tcolor in (("FD", "Fixed Deposit", "#1E40AF"),
+                                             ("MF", "Mutual Fund", "#5B21B6")):
+                _rws = _inv_rows[_stype]
+                if not _rws:
+                    continue
+                _sub = sum(r["balance"] for r in _rws)
+                ircols = st.columns(_ABS_COLS)
                 for _c, _v in zip(ircols, [
                     f'<span class="abs-pill" style="background:#EDE9FE;color:#5B21B6;">INV</span> {entity_name}',
-                    "Investments", "MF + FD", "—",
-                    f'<div style="text-align:right;color:#5B21B6;font-weight:700;">{_inr(_inv)}</div>',
+                    _tlabel, f"{_tlabel}s", "—",
+                    f'<div style="text-align:right;color:{_tcolor};font-weight:700;">{_inr(_sub)}</div>',
                 ]):
                     with _c:
                         st.markdown(_v, unsafe_allow_html=True)
-                entity_total += _inv
+                entity_total += _sub
 
             # Cash Balance row — only when no specific bank account filter is active
             cash_bal = get_cash_asof(entity_name, as_of_date)
             if cash_bal:
-                cash_cols_row = st.columns([2, 1.5, 1.5, 1, 2])
+                cash_cols_row = st.columns(_ABS_COLS)
                 for _c, _v in zip(cash_cols_row, [
                     f'<span class="abs-pill" style="background:#CFFAFE;color:#0891B2;">CASH</span> {entity_name}',
                     "Cash", "Cash at Stores", "—",
@@ -2207,8 +2258,12 @@ if selected_tab == "Summary":
             unsafe_allow_html=True)
         return entity_total
 
-    st.markdown('<div class="section-header" style="margin-bottom:10px;">Account Balance Summary</div>',
-                unsafe_allow_html=True)
+    st.markdown(
+        f'<div style="margin:6px 0 12px;">'
+        f'<div style="font-size:18px;font-weight:800;color:#1B2B4B;letter-spacing:-0.2px;">Account Balance Summary</div>'
+        f'<div style="font-size:11.5px;color:#6B7A90;margin-top:2px;">As on {_fmt_d(as_of_date)}</div>'
+        f'</div>',
+        unsafe_allow_html=True)
 
     _abs_css = """
 <style>
@@ -2218,7 +2273,7 @@ if selected_tab == "Summary":
 </style>"""
     st.markdown(_abs_css, unsafe_allow_html=True)
 
-    _hcols = st.columns([2, 1.5, 1.5, 1, 2])
+    _hcols = st.columns(_ABS_COLS)
     for _c, _hdr in zip(_hcols, ["Entity", "Bank / Type", "Purpose", "Account", "Balance"]):
         with _c:
             st.markdown(
@@ -2252,6 +2307,38 @@ if selected_tab == "Summary":
         f'<span>TOTAL CASH POSITION</span>'
         f'<span>{fmt_inr(_grand_total)}</span></div>',
         unsafe_allow_html=True)
+    # ── Investment ledger: what went where, and when ─────────────────────────
+    if show_investments:
+        with st.expander("📒 Investment ledger — amounts invested and redeemed, with dates"):
+            _lev = pd.DataFrame(get_investment_events(abs_entity_filter))
+            if _lev.empty:
+                st.info("No investments recorded.")
+            else:
+                _lev = _lev[_lev["scheme_type"].isin(["FD", "MF"])]
+                _lev = _lev[_lev["date"].isna() | (_lev["date"] <= as_of_date)].copy()
+                if "opening_date" not in _lev.columns:
+                    _lev["opening_date"] = None
+                _lev["when"] = _lev["date"].fillna(_lev["opening_date"]).fillna("")
+                _lev["Event"] = _lev.apply(
+                    lambda r: "Opening balance" if r["source"] == "Opening"
+                    else ("Invested" if r["delta"] > 0 else "Redeemed"), axis=1)
+                _lev["_ord"] = _lev["source"].apply(lambda x: 0 if x == "Opening" else 1)
+                _lev = _lev.sort_values(["entity", "scheme_type", "scheme_name", "_ord", "when"])
+                _lev["Balance"] = _lev.groupby(["entity", "scheme_type", "scheme_name"])["delta"].cumsum()
+                _ldf = pd.DataFrame({
+                    "Entity": _lev["entity"],
+                    "Type": _lev["scheme_type"].map({"FD": "Fixed Deposit", "MF": "Mutual Fund"}),
+                    "Scheme": _lev["scheme_name"],
+                    "Date": _lev["when"].apply(lambda x: _fmt_d(x) if x else "—"),
+                    "Event": _lev["Event"],
+                    "Amount": _lev["delta"].apply(fmt_inr),
+                    "Balance after": _lev["Balance"].apply(fmt_inr),
+                })
+                _ldf = _ldf[_lev["delta"].abs().values >= 1]
+                st.dataframe(_ldf, use_container_width=True, hide_index=True, height=360,
+                             column_config=amount_config(["Amount", "Balance after"]))
+                st.caption("Amounts are at cost. Opening balances carry the date the FD / fund was placed "
+                           "(set it under Investments → Manage Schemes & Opening Values).")
     st.markdown("<br>", unsafe_allow_html=True)
 
     # ── Day-wise total balance — ignores ALL sidebar filters (whole company) ──
@@ -4052,23 +4139,111 @@ elif selected_tab == "Cash Flow":
                 f'{"✅" if _gt_ok else "⚠️"}</div>',
                 unsafe_allow_html=True)
 
+        # ── Excel export (same rows as the table above, every group expanded) ─
+        def _build_excel_weekly():
+            from openpyxl import Workbook
+            from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+            wb = Workbook()
+            ws = wb.active
+            ws.title = "Weekly Cash Flow"
+            ws.column_dimensions["A"].width = 46
+            for _c in "BCDEF":
+                ws.column_dimensions[_c].width = 22
+            h_fill = PatternFill("solid", fgColor="F1F3F5")
+            t_fill = PatternFill("solid", fgColor="E8F4FD")
+            ws.append(["Particulars"] + _w_labels + ["Total"])
+            for cell in ws[1]:
+                cell.font = Font(bold=True, size=10, color="9CA3AF")
+                cell.fill = h_fill
+                cell.alignment = Alignment(horizontal="right" if cell.column > 1 else "left")
+
+            def _xw(label, vals=None, total=None, style="normal", indent=0):
+                row = [("  " * indent) + label]
+                row += list(vals) if vals is not None else [None] * 4
+                row += [total]
+                ws.append(row)
+                r = ws.max_row
+                for c in range(2, 7):
+                    ws.cell(row=r, column=c).alignment = Alignment(horizontal="right")
+                    ws.cell(row=r, column=c).number_format = "#,##0;-#,##0"
+                if style == "header":
+                    for c in ws[r]:
+                        c.font = Font(bold=True, size=11)
+                        c.fill = h_fill
+                elif style == "total":
+                    for c in ws[r]:
+                        c.font = Font(bold=True, color="1E3A5F")
+                        c.fill = t_fill
+                        c.border = Border(top=Side(style="medium", color="4E8DF5"),
+                                          bottom=Side(style="medium", color="4E8DF5"))
+                elif style == "group":
+                    for c in ws[r]:
+                        c.font = Font(bold=True)
+                elif style == "net":
+                    pos = (total or 0) >= 0
+                    for c in ws[r]:
+                        c.font = Font(bold=True, size=12, color="2E7D32" if pos else "C62828")
+                        c.fill = PatternFill("solid", fgColor="F0FDF4" if pos else "FEF2F2")
+
+            def _balance_block(title, combined, banks, mfc, last):
+                _xw(title, combined, combined[last], style="header")
+                for _bk in sorted(banks[0]):
+                    _v = [banks[i].get(_bk, 0) for i in range(4)]
+                    _xw(f"Bank ({_bk})", _v, _v[last], indent=1)
+                for _lbl, _k in (("Mutual Fund Balance", "mf"), ("Fixed Deposit Balance", "fd"),
+                                 ("Cash at Stores", "cash")):
+                    _v = [mfc[i][_k] for i in range(4)]
+                    _xw(_lbl, _v, _v[last], indent=1)
+
+            def _flow_block(title, total_key, nested_key):
+                _tot = [_wd[total_key] for _wd in _w_data]
+                _xw(title, _tot, sum(_tot), style="total")
+                _nested = [_wd.get(nested_key, {}) for _wd in _w_data]
+                _groups = sorted(set(g for _n in _nested for g in _n),
+                                 key=lambda g: sum(sum(_n.get(g, {}).values()) for _n in _nested), reverse=True)
+                for _g in _groups:
+                    _gv = [sum(_n.get(_g, {}).values()) for _n in _nested]
+                    _xw(_g, _gv, sum(_gv), style="group", indent=1)
+                    _cats = sorted(set(c for _n in _nested for c in _n.get(_g, {})),
+                                   key=lambda c: sum(_n.get(_g, {}).get(c, 0) for _n in _nested), reverse=True)
+                    for _c in _cats:
+                        _cv = [_n.get(_g, {}).get(_c, 0) for _n in _nested]
+                        _xw(_c, _cv, sum(_cv), indent=2)
+
+            # Opening: first week's opening is the period opening
+            _balance_block("Opening Balance", _ob_combined, _bank_open, _mfc_open, 0)
+            _flow_block("Add Receipts", "total_receipts", "receipts_nested")
+            _flow_block("Less Payouts", "total_payouts", "payouts_nested")
+            for _lbl, _k in (("Interbank (Net)", "interbank_period_net"),
+                             ("Intercompany (Net)", "intercompany_period_net")):
+                _v = [_wd.get(_k) or 0 for _wd in _w_data]
+                if any(abs(x) > 1 for x in _v):
+                    _xw(_lbl, _v, sum(_v), style="header")
+            _cc = [_mfc_close[i]["cash"] - _mfc_open[i]["cash"] for i in range(4)]
+            if any(abs(x) > 1 for x in _cc):
+                _xw("Cash at Stores (Net change)", _cc, sum(_cc), style="header")
+            _balance_block("Closing Balance", _cb_combined, _bank_close, _mfc_close, 3)
+            _xw("Net Movement", _wnet_vals, _total_wnet, style="net")
+            _xw("Tally difference (computed vs DB)", [_w_data[i]["tally_diff"] for i in range(4)], None)
+            out = io.BytesIO()
+            wb.save(out)
+            return out.getvalue()
+
+        _, _wxl = st.columns([8.5, 1.5])
+        with _wxl:
+            _wxl_name = (f"weekly_cashflow_{cf_entity or 'All'}_{_w1_start}_{_w4_end}.xlsx"
+                         .replace(" ", "_").replace("/", "-"))
+            st.download_button(
+                "⬇️ Export Excel", _build_excel_weekly(), file_name=_wxl_name,
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                use_container_width=True, key="dl_weekly_cf")
+
 # ══════════════════════════════════════════════════════════════════════════════
 # INVESTMENTS
 # ══════════════════════════════════════════════════════════════════════════════
 elif selected_tab == "Investments":
 
-    st.markdown("## Investment Portfolio")
-
-    # ── Filters — Entity only; dates come from sidebar Date Range ────────────
-    f1, f2 = st.columns([2, 2])
-    with f1:
-        inv_entity = st.radio(
-            "Entity", ["All", "Stores", "Ventures"],
-            horizontal=True, key="inv_entity")
-    with f2:
-        st.markdown("<br>", unsafe_allow_html=True)
-        if st.button("🔄 Refresh", key="inv_refresh"):
-            st.rerun()
+    render_investment_header()
 
     # Use sidebar date range if set, else default to full history
     if use_date_range and sel_date_from and sel_date_to:
@@ -4079,7 +4254,7 @@ elif selected_tab == "Investments":
         inv_date_to   = None
 
     # ── Get data ──────────────────────────────────────────────────────────────
-    entity_filter = inv_entity if inv_entity != "All" else None
+    entity_filter = eff_entity
     inv_data = get_investment_summary(
         entity=entity_filter,
         date_from=inv_date_from,
@@ -4093,7 +4268,19 @@ elif selected_tab == "Investments":
         st.success(st.session_state.pop("inv_flash"))
 
     # ── Management view: balance, gains, ROI, FD vs Mutual Fund ───────────────
-    render_investment_overview(entity_filter, as_of_date)
+    # Period: date range > month > financial year (all from the sidebar)
+    if use_date_range:
+        _w0, _w1 = str(sel_date_from), str(sel_date_to)
+        _wl = f"{sel_date_from.strftime('%d %b %Y')} to {sel_date_to.strftime('%d %b %Y')}"
+    elif eff_month:
+        _my, _mm = int(eff_month[:4]), int(eff_month[5:7])
+        _w0 = f"{_my}-{_mm:02d}-01"
+        _w1 = str(datetime.date(_my + (_mm == 12), _mm % 12 + 1, 1) - datetime.timedelta(days=1))
+        _wl = datetime.date(_my, _mm, 1).strftime("%b %Y")
+    else:
+        _w0, _w1 = str(FY_BOUNDS[sel_fy][0]), str(FY_BOUNDS[sel_fy][1])
+        _wl = sel_fy_label
+    render_investment_overview(entity_filter, as_of_date, _w0, _w1, _wl)
 
     st.markdown("---")
     st.markdown('<div class="section-header" style="margin:6px 0 10px;">Details &amp; Data Entry</div>',
@@ -4285,14 +4472,14 @@ elif selected_tab == "Investments":
     # ── Manage Schemes & Opening Values ──────────────────────────────────────
     with st.expander("⚙️ Manage Schemes & Opening Values", expanded=False):
         st.caption(
-            "Set the opening value for each scheme as on 1st April. "
+            "Set the amount held in each scheme and the date it was invested (shown on the Summary tab). "
             "These are saved permanently in the database.")
 
         all_schemes = get_investment_register()
 
         st.markdown("##### Update Opening Values")
         for _scheme in all_schemes:
-            _ec1, _ec2, _ec3, _ec4 = st.columns([2, 2, 2, 1])
+            _ec1, _ec2, _ec3, _ec3b, _ec4 = st.columns([2, 1.6, 1.4, 1.6, 1])
             with _ec1:
                 st.markdown(
                     f'<div style="padding-top:8px;font-weight:600;">'
@@ -4315,18 +4502,26 @@ elif selected_tab == "Investments":
                     index=0 if _scheme["entity"] == "Stores" else 1,
                     key=f"ent_{_scheme['scheme_name']}",
                     label_visibility="collapsed")
+            with _ec3b:
+                try:
+                    _od0 = datetime.date.fromisoformat(str(_scheme["opening_date"])[:10])
+                except Exception:
+                    _od0 = datetime.date(2026, 4, 1)
+                _new_od = st.date_input(
+                    "Invested on", value=_od0, format="DD/MM/YYYY",
+                    key=f"od_{_scheme['scheme_name']}", label_visibility="collapsed")
             with _ec4:
                 if st.button("💾 Save", key=f"save_{_scheme['scheme_name']}"):
                     update_investment_opening(
                         _scheme["scheme_name"], _new_val,
-                        "2026-04-01", _new_ent)
+                        str(_new_od), _new_ent)
                     st.cache_data.clear()
                     st.success(f"Saved {_scheme['scheme_name']}")
                     st.rerun()
 
         st.markdown("---")
         st.markdown("##### Add New Scheme")
-        _na1, _na2, _na3, _na4, _na5 = st.columns([2, 1, 1, 2, 1])
+        _na1, _na2, _na3, _na4, _na4b, _na5 = st.columns([2, 1, 1, 1.6, 1.4, 1])
         with _na1:
             _new_name = st.text_input(
                 "Scheme Name", placeholder="e.g. FD-5 or MF-Scheme-4",
@@ -4340,13 +4535,16 @@ elif selected_tab == "Investments":
             _new_opening = st.number_input(
                 "Opening Value (₹)", min_value=0.0,
                 step=10000.0, key="new_scheme_opening")
+        with _na4b:
+            _new_od2 = st.date_input("Invested on", value=datetime.date.today(),
+                                     format="DD/MM/YYYY", key="new_scheme_date")
         with _na5:
             st.markdown("<br>", unsafe_allow_html=True)
             if st.button("➕ Add", key="add_scheme_btn"):
                 if _new_name.strip():
                     add_investment_scheme(
                         _new_name.strip(), _new_type,
-                        _new_ent2, _new_opening, "2026-04-01")
+                        _new_ent2, _new_opening, str(_new_od2))
                     st.cache_data.clear()
                     st.success(f"Added {_new_name}")
                     st.rerun()

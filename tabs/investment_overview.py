@@ -12,36 +12,170 @@ import streamlit as st
 from database import (
     get_capital_gain_lots, compute_fifo, get_entity_investment_asof, get_fd_rate_card,
     save_fd_rate_card, import_cg_sheet, import_opening_lots, get_opening_lots,
-    get_latest_data_date,
+    get_latest_data_date, get_investment_events, _fund_type,
+    compute_fd_earnings, get_fd_terms, import_fd_terms, save_fd_terms, build_fd_terms_workbook,
 )
 from queries.cashflow_queries import get_investment_mf_asof
 from utils.formatters import fmt_inr, fmt_cr
 from utils.ui import amount_config
 
+_H = 178   # KPI card height (px) — every card is the same height
+
 _CSS = """
 <style>
-.iv-kpis { display: grid; grid-template-columns: repeat(4, 1fr); gap: 16px; margin: 6px 0 20px; }
-.iv-kpi { position: relative; overflow: hidden; background: #FFFFFF; border: 1px solid #E2E7EF;
-  border-radius: 16px; padding: 20px 24px 18px; box-shadow: 0 2px 8px rgba(10,22,40,0.06); }
-.iv-kpi::before { content: ''; position: absolute; left: 0; top: 0; bottom: 0; width: 5px; background: #1B2B4B; }
-.iv-kpi.g::before { background: #22C55E; } .iv-kpi.b::before { background: #2563EB; } .iv-kpi.r::before { background: #EF4444; }
-.iv-label { font-size: 10.5px; font-weight: 700; letter-spacing: 0.14em; text-transform: uppercase; color: #6B7A90; margin-bottom: 10px; }
-.iv-val { font-size: 30px; font-weight: 800; letter-spacing: -0.8px; line-height: 1.05; color: #0A1628; font-variant-numeric: tabular-nums; }
-.iv-kpi.g .iv-val { color: #166534; } .iv-kpi.r .iv-val { color: #991B1B; }
-.iv-sub { font-size: 12px; color: #6B7A90; margin-top: 9px; line-height: 1.45; font-variant-numeric: tabular-nums; }
-.iv-hero { background: linear-gradient(135deg, #081528 0%, #1B2B4B 60%, #2E4A72 100%); border-color: #1B2B4B; }
-.iv-hero::before { background: #4ADE80; }
-.iv-hero .iv-label { color: rgba(255,255,255,0.55); } .iv-hero .iv-val { color: #FFFFFF; } .iv-hero .iv-sub { color: rgba(255,255,255,0.6); }
-.iv-h { font-size: 12px; font-weight: 800; letter-spacing: 0.16em; text-transform: uppercase; color: #1B2B4B; margin: 26px 0 4px; }
-.iv-sub-h { font-size: 12.5px; color: #6B7A90; margin: 0 0 10px; }
-.iv-box { border-radius: 14px; padding: 16px 22px; margin: 10px 0 14px; font-size: 13.5px; line-height: 1.6; border: 1px solid; }
-.iv-box.good { background: #ECFDF3; border-color: #BBF7D0; color: #14532D; }
-.iv-box.warn { background: #FFF7ED; border-color: #FDBA74; color: #7C2D12; }
-.iv-box.info { background: #EAF0FA; border-color: #C8D3E0; color: #1B2B4B; }
-.iv-box ul { margin: 6px 0 0 18px; padding: 0; }
-.iv-box li { margin: 3px 0; }
+.iv-top { display:flex; justify-content:space-between; align-items:flex-end; gap:16px; flex-wrap:wrap; margin-bottom:4px; }
+.iv-title { font-size:30px; font-weight:800; letter-spacing:-0.6px; color:#0A1628; line-height:1.1; }
+.iv-subtitle { font-size:13.5px; color:#6B7A90; margin-top:4px; }
+.iv-chips { display:flex; gap:8px; flex-wrap:wrap; }
+.iv-chip { background:#FFFFFF; border:1px solid #E2E7EF; border-radius:999px; padding:5px 12px; font-size:12px; color:#3B4A63; }
+.iv-chip b { color:#0A1628; font-weight:700; }
+.iv-kpi { position:relative; overflow:hidden; background:#FFFFFF; border:1px solid #E2E7EF; border-radius:14px;
+  padding:18px 22px 14px; box-shadow:0 1px 4px rgba(10,22,40,0.06); height:__H__px; box-sizing:border-box; }
+.iv-kpi::before { content:''; position:absolute; left:0; top:0; bottom:0; width:4px; background:#1B2B4B; }
+.iv-kpi.g::before { background:#16A34A; } .iv-kpi.b::before { background:#2563EB; } .iv-kpi.r::before { background:#DC2626; }
+.iv-kpi.n::before { background:#94A3B8; }
+.iv-label { font-size:10.5px; font-weight:700; letter-spacing:0.13em; text-transform:uppercase; color:#6B7A90; margin-bottom:8px; }
+.iv-val { font-size:29px; font-weight:800; letter-spacing:-0.7px; line-height:1.05; color:#0A1628; font-variant-numeric:tabular-nums; }
+.iv-kpi.g .iv-val { color:#166534; } .iv-kpi.r .iv-val { color:#991B1B; }
+.iv-sub { font-size:12px; color:#6B7A90; margin-top:8px; line-height:1.5; font-variant-numeric:tabular-nums; }
+.iv-hero { background:#14233F; border-color:#14233F; }
+.iv-hero::before { background:#4ADE80; }
+.iv-hero .iv-label { color:rgba(255,255,255,0.6); } .iv-hero .iv-val { color:#FFFFFF; } .iv-hero .iv-sub { color:rgba(255,255,255,0.72); }
+.iv-hint { margin-top:7px; font-size:11.5px; font-weight:600; color:#7DD3FC; }
+.iv-bar { display:flex; height:10px; border-radius:5px; overflow:hidden; background:#E2E7EF; margin-top:12px; }
+.iv-bar span { display:block; height:100%; }
+.iv-legend { display:flex; justify-content:space-between; font-size:12px; color:#3B4A63; margin-top:8px; font-variant-numeric:tabular-nums; }
+.iv-dot { display:inline-block; width:9px; height:9px; border-radius:50%; margin-right:6px; }
+.iv-h { font-size:12px; font-weight:800; letter-spacing:0.16em; text-transform:uppercase; color:#1B2B4B; margin:28px 0 4px; }
+.iv-sub-h { font-size:12.5px; color:#6B7A90; margin:0 0 10px; }
+.iv-box { border-radius:12px; padding:16px 22px; margin:10px 0 14px; font-size:13.5px; line-height:1.6; border:1px solid; }
+.iv-box.good { background:#ECFDF3; border-color:#BBF7D0; color:#14532D; }
+.iv-box.warn { background:#FFF7ED; border-color:#FDBA74; color:#7C2D12; }
+.iv-box.info { background:#EAF0FA; border-color:#C8D3E0; color:#1B2B4B; }
+.iv-box ul { margin:6px 0 0 18px; padding:0; }
+.iv-box li { margin:3px 0; }
+.iv-panel { background:#FFFFFF; border:1px solid #E2E7EF; border-radius:14px; padding:18px 22px; box-shadow:0 1px 4px rgba(10,22,40,0.05); margin:4px 0 10px; }
+.iv-tbl-wrap { max-height:420px; overflow:auto; border:1px solid #E2E7EF; border-radius:12px; background:#fff; }
+table.iv-tbl { width:100%; border-collapse:collapse; font-size:13px; font-variant-numeric:tabular-nums; }
+table.iv-tbl th { position:sticky; top:0; background:#F4F6FA; color:#3B4A63; font-weight:700; font-size:11.5px;
+  text-transform:uppercase; letter-spacing:0.06em; padding:10px 12px; text-align:right; border-bottom:1px solid #E2E7EF; white-space:nowrap; }
+table.iv-tbl th:first-child, table.iv-tbl td:first-child { text-align:left; }
+table.iv-tbl td { padding:9px 12px; text-align:right; border-bottom:1px solid #EEF1F6; color:#0A1628; white-space:nowrap; }
+table.iv-tbl tr.tot td { background:#EAF0FA; font-weight:800; border-top:2px solid #1B2B4B; border-bottom:none; }
+table.iv-tbl .pos { color:#166534; font-weight:700; } table.iv-tbl .neg { color:#991B1B; font-weight:700; }
+/* clickable balance card: invisible button laid over the card */
+.st-key-iv_toggle { margin-top:-__HG__px; height:__H__px; position:relative; z-index:5; }
+.st-key-iv_toggle button { width:100%; height:__H__px; opacity:0; cursor:pointer; }
+.st-key-iv_toggle > div, .st-key-iv_toggle [data-testid="stElementContainer"] { height:__H__px; }
 </style>
-"""
+""".replace("__HG__", str(_H)).replace("__H__", str(_H))
+
+
+def _rs(x):
+    """₹ with Indian grouping, minus sign in front."""
+    return fmt_inr(x)
+
+
+def _bank_of(name):
+    """FD names carry the bank in brackets, e.g. '925040079999702 (Axis)'."""
+    if "(" in name and name.strip().endswith(")"):
+        return name[name.rindex("(") + 1:-1].strip() or "Other"
+    return "Other / untagged"
+
+
+def _breakdown(entity, as_of):
+    """Per-scheme balances (at cost) from the same event feed as the Summary tab."""
+    ents = [entity] if entity else ["Stores", "Ventures"]
+    ev = pd.DataFrame(get_investment_events(entity))
+    if ev.empty:
+        return pd.DataFrame(columns=["entity", "scheme_type", "scheme_name", "balance"])
+    ev = ev[ev["date"].isna() | (ev["date"] <= as_of)]
+    ev = ev[ev["entity"].isin(ents)]
+    g = ev.groupby(["entity", "scheme_type", "scheme_name"], as_index=False)["delta"].sum()
+    return g.rename(columns={"delta": "balance"})
+
+
+def _alloc_pct(fd, mf):
+    """FD / MF share, one decimal, forced to add up to 100.0."""
+    tot = fd + mf
+    if tot <= 0:
+        return 0.0, 0.0
+    f = round(fd / tot * 100, 1)
+    return f, round(100.0 - f, 1)
+
+
+def _card(cls, label, value, sub, extra=""):
+    return (f'<div class="iv-kpi {cls}"><div class="iv-label">{label}</div>'
+            f'<div class="iv-val">{value}</div><div class="iv-sub">{sub}</div>{extra}</div>')
+
+
+def render_investment_header(entity_label=None, as_of=None):
+    """Page title."""
+    st.markdown(_CSS, unsafe_allow_html=True)
+    st.markdown('<div class="iv-title">Investment Portfolio</div>', unsafe_allow_html=True)
+
+
+def _flip():
+    st.session_state["iv_open"] = not st.session_state.get("iv_open", False)
+
+
+def _render_breakdown(bd, fd_bal, mf_bal, total, fd_stats=None, mf_stats=None, notes=None):
+    """fd_stats / mf_stats: {key: dict(earned, roi, ann, days)} plus key '__total__'."""
+    fd_df = bd[bd["scheme_type"] == "FD"].copy()
+    mf_df = bd[bd["scheme_type"] == "MF"].copy()
+    fd_df = fd_df[fd_df["balance"].abs() >= 1]
+    mf_df = mf_df[mf_df["balance"].abs() >= 1]
+
+    st.markdown("<div style='height:6px'></div>", unsafe_allow_html=True)
+    _, h2 = st.columns([6, 1])
+    with h2:
+        st.button("▲ Collapse", key="iv_collapse", on_click=_flip, use_container_width=True)
+
+    def _cells(x):
+        if not x:
+            return "<td>—</td><td>—</td><td>—</td><td>—</td>"
+        gc = "pos" if x["earned"] >= 0 else "neg"
+        return (f"<td class='{gc}'>{_rs(x['earned'])}</td><td>{_pct(x['roi'])}</td>"
+                f"<td>{_pct(x['ann'])}</td><td>{x['days']:.0f}</td>")
+
+    def _tbl(df, key_col, title, total_ref, stats, earned_label):
+        if df.empty:
+            return f"<div class='iv-sub-h'>{title}: no balances.</div>"
+        stats = stats or {}
+        g = df.groupby(key_col, as_index=False)["balance"].sum().sort_values("balance", ascending=False)
+        rows = "".join(f"<tr><td>{r[key_col]}</td><td>{_rs(r['balance'])}</td>"
+                       f"<td>{(r['balance'] / total_ref * 100 if total_ref else 0):.1f}%</td>"
+                       f"{_cells(stats.get(r[key_col]))}</tr>" for _, r in g.iterrows())
+        rest = total_ref - g["balance"].sum()
+        if abs(rest) >= 1:
+            rows += (f"<tr><td>Other / unallocated</td><td>{_rs(rest)}</td>"
+                     f"<td>{(rest / total_ref * 100):.1f}%</td>{_cells(None)}</tr>")
+        rows += (f"<tr class='tot'><td>Total</td><td>{_rs(total_ref)}</td><td>100.0%</td>"
+                 f"{_cells(stats.get('__total__'))}</tr>")
+        return (f"<div class='iv-label' style='margin-top:14px'>{title}</div>"
+                f"<div class='iv-tbl-wrap'><table class='iv-tbl'><thead><tr><th>{key_col}</th><th>Balance</th>"
+                f"<th>Contribution</th><th>{earned_label}</th><th>ROI</th><th>Return p.a.</th>"
+                f"<th>Avg holding (days)</th></tr></thead><tbody>{rows}</tbody></table></div>")
+
+    d1, d2 = st.columns(2)
+    with d1:
+        st.markdown("**Fixed Deposits**")
+        if not fd_df.empty:
+            fd_df["Bank"] = fd_df["scheme_name"].apply(_bank_of)
+        st.markdown(_tbl(fd_df, "Bank", "By bank", fd_bal, fd_stats, "Interest earned")
+                    if not fd_df.empty else "", unsafe_allow_html=True)
+        if fd_stats:
+            st.caption("Interest = quarterly compounding on each FD's own rate and dates, for the period selected "
+                       "above. ROI = interest / average capital deployed in the period. Return p.a. is on original "
+                       "principal, so it can sit above the stated rate late in a term (interest on interest).")
+        for n in (notes or []):
+            st.warning(n)
+    with d2:
+        st.markdown("**Mutual Funds**")
+        if not mf_df.empty:
+            mf_df["Fund category"] = mf_df["scheme_name"].apply(_fund_type)
+        st.markdown(_tbl(mf_df, "Fund category", "By fund category", mf_bal, mf_stats, "Gain realised")
+                    if not mf_df.empty else "", unsafe_allow_html=True)
 
 
 @st.cache_data(ttl=300, show_spinner=False)
@@ -79,63 +213,112 @@ def _verdict(mf_ann, fd_ann, n):
     return v + (" (few lots)" if n < 3 else "")
 
 
-def render_investment_overview(entity=None, as_of=None):
-    """entity: None (all) / 'Stores' / 'Ventures'."""
+def render_investment_overview(entity=None, as_of=None, win_from=None, win_to=None, win_label="All time"):
+    """entity: None (all) / 'Stores' / 'Ventures'.  win_*: the sidebar period (FY / month / date range)."""
     st.markdown(_CSS, unsafe_allow_html=True)
     ents = [entity] if entity else ["Stores", "Ventures"]
     as_of = as_of or get_latest_data_date() or str(datetime.date.today())
+    as_of_txt = datetime.date.fromisoformat(as_of).strftime('%d %b %Y')
 
-    # ── balances (at cost) ───────────────────────────────────────────────────
+    # ── balances (at cost) — FD = combined − MF, exactly as the Cash Flow tab ─
     total = sum(get_entity_investment_asof(e, as_of) for e in ents)
     mf_bal = sum(get_investment_mf_asof(e, as_of) for e in ents)
     fd_bal = total - mf_bal
+    fd_pct, mf_pct = _alloc_pct(fd_bal, mf_bal)
+    bd = _breakdown(entity, as_of)
+    n_fd = int((bd[bd["scheme_type"] == "FD"]["balance"].abs() >= 1).sum()) if not bd.empty else 0
+    n_mf = int((bd[bd["scheme_type"] == "MF"]["balance"].abs() >= 1).sum()) if not bd.empty else 0
 
     lots = pd.DataFrame(_lots(entity))
     fifo = _fifo(entity)
 
-    # ── period selector ──────────────────────────────────────────────────────
-    cur_fy = None
-    try:
-        y, m = int(as_of[:4]), int(as_of[5:7])
-        s0 = y if m >= 4 else y - 1
-        cur_fy = f"FY {s0}-{str(s0 + 1)[2:]}"
-    except Exception:
-        pass
-    fy_opts = sorted(lots["fy"].unique(), reverse=True) if not lots.empty else []
-    options = fy_opts + ["All time"]
-    default_idx = options.index(cur_fy) if cur_fy in options else len(options) - 1
-    period = st.radio("Period for gains & returns", options, index=default_idx,
-                      horizontal=True, key="inv_ov_period")
-    sel = lots if (lots.empty or period == "All time") else lots[lots["fy"] == period]
+    # ── Period comes from the sidebar filters (date range > month > financial year) ──
+    period = win_label
+    if lots.empty:
+        sel = lots
+    else:
+        sel = lots
+        if win_from:
+            sel = sel[sel["sale_date"] >= win_from]
+        if win_to:
+            sel = sel[sel["sale_date"] <= win_to]
     a = _agg(sel)
 
-    # ── KPI cards ────────────────────────────────────────────────────────────
-    gain_cls = "g" if a["gain"] >= 0 else "r"
-    ben_cls = "g" if a["benefit"] >= 0 else "r"
-    ben_txt = "ahead of" if a["benefit"] >= 0 else "behind"
-    st.markdown(f"""
-<div class="iv-kpis">
-  <div class="iv-kpi iv-hero">
-    <div class="iv-label">Current Investment Balance</div>
-    <div class="iv-val">{fmt_cr(total)}</div>
-    <div class="iv-sub">FD {fmt_cr(fd_bal)} &nbsp;·&nbsp; Mutual Funds {fmt_cr(mf_bal)}<br>at cost, as on {datetime.date.fromisoformat(as_of).strftime('%d %b %Y')}</div>
-  </div>
-  <div class="iv-kpi {gain_cls}">
-    <div class="iv-label">Gains Earned · {period}</div>
-    <div class="iv-val">{fmt_cr(a['gain'])}</div>
-    <div class="iv-sub">{fmt_inr(a['gain'])}<br>on {fmt_cr(a['cost'])} redeemed · {a['n']} lots</div>
-  </div>
-  <div class="iv-kpi b">
-    <div class="iv-label">Return on Investment</div>
-    <div class="iv-val">{_pct(a['ann'])} <span style="font-size:14px;font-weight:600;color:#6B7A90;">p.a.</span></div>
-    <div class="iv-sub">Simple ROI {_pct(a['roi'])} · avg holding {a['days']:.0f} days</div>
-  </div>
-  <div class="iv-kpi {ben_cls}">
-    <div class="iv-label">Versus Fixed Deposit</div>
-    <div class="iv-val">{fmt_cr(a['benefit'])}</div>
-    <div class="iv-sub">Mutual funds {ben_txt} FD by {fmt_inr(abs(a['benefit']))}<br>FD would have paid {fmt_inr(a['fd'])} ({_pct(a['fd_ann'])} p.a.)</div>
-  </div>
-</div>""", unsafe_allow_html=True)
+    # FD interest for the same period
+    w0 = win_from
+    w1 = min(as_of, win_to) if win_to else as_of
+    fd_terms = get_fd_terms()
+    earn = compute_fd_earnings(entity, w0, w1) if fd_terms else []
+    fd_stats = {}
+    if earn:
+        edf = pd.DataFrame(earn)
+        d_from = datetime.date.fromisoformat(w0) if w0 else datetime.date.fromisoformat(edf["start"].min())
+        wdays = (datetime.date.fromisoformat(w1) - d_from).days or 1
+
+        def _fs(g):
+            i, cd, pr = g["interest"].sum(), g["cap_days"].sum(), g["principal"].sum()
+            return dict(earned=i, roi=(i / (cd / wdays)) if cd else 0.0, ann=(i / cd * 365) if cd else 0.0,
+                        days=(cd / pr) if pr else 0.0)
+        for bnk, g in edf.groupby("bank"):
+            fd_stats[bnk] = _fs(g)
+        fd_stats["__total__"] = _fs(edf)
+    fd_notes = []
+    if fd_terms:
+        last = {}
+        for t in fd_terms:
+            k = (t["entity"], t["account_no"])
+            if k not in last or t["start_date"] > last[k]["start_date"]:
+                last[k] = t
+        stale = [t for t in last.values()
+                 if t.get("end_date") and t["end_date"] < as_of and "redeem" not in (t.get("status") or "").lower()
+                 and (entity is None or t["entity"] == entity)]
+        if stale:
+            amt = sum(t["principal"] for t in stale)
+            fd_notes.append(
+                f"{len(stale)} FD(s) worth {fmt_inr(amt)} passed their last recorded maturity date "
+                f"({', '.join(sorted(t['account_no'] for t in stale))}). Interest stops at that date. "
+                f"Add the renewal terms under Setup, FD terms, to include later interest.")
+    mf_stats = {}
+    if not sel.empty:
+        for ft, g in sel.groupby("fund_type"):
+            x = _agg(g)
+            mf_stats[ft] = dict(earned=x["gain"], roi=x["roi"], ann=x["ann"], days=x["days"])
+        x = _agg(sel)
+        mf_stats["__total__"] = dict(earned=x["gain"], roi=x["roi"], ann=x["ann"], days=x["days"])
+
+    # ── Row 1: portfolio overview ────────────────────────────────────────────
+    is_open = st.session_state.get("iv_open", False)
+    k1, k2, k3, k4 = st.columns(4)
+    with k1:
+        st.markdown(_card(
+            "iv-hero", "Total Investment Portfolio", fmt_cr(total),
+            f"FD {fmt_cr(fd_bal)} &nbsp;·&nbsp; Mutual Funds {fmt_cr(mf_bal)}<br>at cost, as on {as_of_txt}",
+            f'<div class="iv-hint">{"▲ Hide" if is_open else "▼ Click for breakdown"}</div>'),
+            unsafe_allow_html=True)
+        with st.container(key="iv_toggle"):
+            st.button("toggle", key="iv_toggle_btn", on_click=_flip, use_container_width=True)
+    with k2:
+        st.markdown(_card(
+            "b", "Fixed Deposit Investment", fmt_cr(fd_bal),
+            f"{n_fd} active deposit{'s' if n_fd != 1 else ''} · principal at cost<br>"
+            + (f"Interest earned {period}: {fmt_cr(fd_stats['__total__']['earned'])}<br>"
+               f"{_pct(fd_stats['__total__']['ann'])} p.a."
+               if fd_stats else "Interest not shown: load FD terms in Setup")), unsafe_allow_html=True)
+    with k3:
+        st.markdown(_card(
+            "b", "Mutual Fund Portfolio", fmt_cr(mf_bal),
+            f"{n_mf} scheme{'s' if n_mf != 1 else ''} · invested cost<br>"
+            f"Market value &amp; unrealised gain not tracked"), unsafe_allow_html=True)
+    with k4:
+        bar = (f'<div class="iv-bar"><span style="width:{fd_pct}%;background:#1B2B4B"></span>'
+               f'<span style="width:{mf_pct}%;background:#60A5FA"></span></div>'
+               f'<div class="iv-legend"><span><span class="iv-dot" style="background:#1B2B4B"></span>FD {fd_pct:.1f}%</span>'
+               f'<span><span class="iv-dot" style="background:#60A5FA"></span>MF {mf_pct:.1f}%</span></div>')
+        st.markdown(_card("n", "Portfolio Allocation", f"{fd_pct:.1f}% / {mf_pct:.1f}%",
+                          "Fixed Deposits / Mutual Funds", bar), unsafe_allow_html=True)
+
+    if is_open:
+        _render_breakdown(bd, fd_bal, mf_bal, total, fd_stats, mf_stats, fd_notes)
 
     if fifo["unmatched"]:
         for u in fifo["unmatched"]:
@@ -150,63 +333,16 @@ def render_investment_overview(entity=None, as_of=None):
         _setup_panel()
         return
 
-    # ── returns by fund type ─────────────────────────────────────────────────
-    st.markdown('<div class="iv-h">Returns by fund type</div>', unsafe_allow_html=True)
-    st.markdown(f'<div class="iv-sub-h">Realised lots, {period}. FD equivalent = the same money in an FD for the same holding period.</div>',
-                unsafe_allow_html=True)
-    if sel.empty:
-        st.info("No redemptions in this period.")
-    else:
-        rows = []
-        for ft, g in sel.groupby("fund_type"):
-            x = _agg(g)
-            rows.append({"Fund type": ft, "Lots": x["n"], "Capital sold": fmt_inr(x["cost"]),
-                         "Gain": fmt_inr(x["gain"]), "ROI": _pct(x["roi"]), "Return p.a.": _pct(x["ann"]),
-                         "Avg days": f"{x['days']:.0f}", "FD equivalent": fmt_inr(x["fd"]),
-                         "FD rate p.a.": _pct(x["fd_ann"]), "Benefit vs FD": fmt_inr(x["benefit"])})
-        rows.append({"Fund type": "TOTAL", "Lots": a["n"], "Capital sold": fmt_inr(a["cost"]),
-                     "Gain": fmt_inr(a["gain"]), "ROI": _pct(a["roi"]), "Return p.a.": _pct(a["ann"]),
-                     "Avg days": f"{a['days']:.0f}", "FD equivalent": fmt_inr(a["fd"]),
-                     "FD rate p.a.": _pct(a["fd_ann"]), "Benefit vs FD": fmt_inr(a["benefit"])})
-        st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True,
-                     column_config=amount_config(["Capital sold", "Gain", "ROI", "Return p.a.", "Avg days",
-                                                  "FD equivalent", "FD rate p.a.", "Benefit vs FD"]))
-
-        # monthly chart
-        mon = sel.groupby("month").agg(gain=("gain", "sum"), fd=("fd_interest", "sum")).reset_index().sort_values("month")
-        fig = go.Figure()
-        fig.add_trace(go.Bar(name="Mutual fund gain", x=mon["month"], y=mon["gain"] / 1e5,
-                             marker_color="#1B2B4B", hovertemplate="%{x}<br>MF gain ₹%{y:,.1f} L<extra></extra>"))
-        fig.add_trace(go.Bar(name="FD equivalent", x=mon["month"], y=mon["fd"] / 1e5,
-                             marker_color="#93C5FD", hovertemplate="%{x}<br>FD ₹%{y:,.1f} L<extra></extra>"))
-        fig.update_layout(barmode="group", height=300, plot_bgcolor="#FFFFFF", paper_bgcolor="#FFFFFF",
-                          font=dict(family="Inter", size=11), legend=dict(orientation="h", y=1.12),
-                          title=dict(text="Gain by month of redemption vs FD equivalent (₹ lakh)", x=0, font=dict(size=13)),
-                          xaxis=dict(showgrid=False), yaxis=dict(showgrid=True, gridcolor="#F0F0F0"),
-                          margin=dict(l=0, r=0, t=50, b=0))
-        st.plotly_chart(fig, use_container_width=True)
-
     # ── FD vs MF comparison + recommendation ────────────────────────────────
-    st.markdown('<div class="iv-h">Fixed Deposit vs Mutual Fund — which was better?</div>', unsafe_allow_html=True)
-    st.markdown('<div class="iv-sub-h">Based on your realised redemptions, all periods. Pre-tax, like the capital-gain sheet. '
-                'Opportunity cost = what an FD would have paid minus what the mutual fund earned, where the FD was ahead.</div>',
-                unsafe_allow_html=True)
-    allx = _agg(lots)
-    mf_better = lots[lots["benefit"] > 0]
-    fd_better = lots[lots["benefit"] < 0]
-    cls = "good" if allx["benefit"] >= 0 else "warn"
-    st.markdown(f"""
-<div class="iv-box {cls}">
-  <b>Overall:</b> mutual funds earned {fmt_inr(allx['gain'])} against {fmt_inr(allx['fd'])} from an FD over the same holding periods —
-  <b>{'ahead' if allx['benefit'] >= 0 else 'behind'} by {fmt_inr(abs(allx['benefit']))}</b>
-  ({_pct(allx['ann'])} vs {_pct(allx['fd_ann'])} p.a.).<br>
-  Mutual fund beat FD on <b>{len(mf_better)}</b> lots (+{fmt_inr(mf_better['benefit'].sum())}); FD would have paid more on
-  <b>{len(fd_better)}</b> lots — a <b>missed opportunity of {fmt_inr(lots['missed'].sum())}</b>.
-</div>""", unsafe_allow_html=True)
+    st.markdown('<div class="iv-h">Opportunity cost</div>', unsafe_allow_html=True)
+    if sel.empty:
+        st.info("No mutual fund redemptions in the selected period.")
+        _setup_panel()
+        return
 
     # by holding period
     slab_rows, slab_reco = [], []
-    for (smin, slab), g in lots.groupby(["slab_min", "slab"]):
+    for (smin, slab), g in sel.groupby(["slab_min", "slab"]):
         x = _agg(g)
         v = _verdict(x["ann"], x["fd_ann"], x["n"])
         slab_rows.append({"Holding period": slab, "Lots": x["n"], "Capital": fmt_inr(x["cost"]),
@@ -224,7 +360,7 @@ def render_investment_overview(entity=None, as_of=None):
 
     # by fund type x holding period
     pocket_rows, pockets = [], []
-    for (ft, smin, slab), g in lots.groupby(["fund_type", "slab_min", "slab"]):
+    for (ft, smin, slab), g in sel.groupby(["fund_type", "slab_min", "slab"]):
         x = _agg(g)
         v = _verdict(x["ann"], x["fd_ann"], x["n"])
         pocket_rows.append({"Fund type": ft, "Holding period": slab, "Lots": x["n"], "Capital": fmt_inr(x["cost"]),
@@ -237,24 +373,6 @@ def render_investment_overview(entity=None, as_of=None):
         st.dataframe(pdf, use_container_width=True, hide_index=True,
                      column_config=amount_config(["Capital", "Mutual fund p.a.", "FD p.a.", "Benefit (MF − FD)",
                                                   "Missed opportunity"]))
-
-    # plain-English guidance
-    bullets = []
-    for smin, slab, pick, x in sorted(slab_reco, key=lambda t: t[0]):
-        bullets.append(f"<b>{slab}:</b> prefer <b>{pick}</b> — mutual funds returned {_pct(x['ann'])} p.a. vs FD "
-                       f"{_pct(x['fd_ann'])} ({'+' if x['benefit'] >= 0 else '−'}{fmt_inr(abs(x['benefit']))} over {x['n']} lots).")
-    worst = sorted([p for p in pockets if p[2]["n"] >= 3 and p[2]["benefit"] < 0], key=lambda p: p[2]["benefit"])[:3]
-    flags = [f"<b>{ft} held {slab}:</b> FD would have been better — mutual fund {_pct(x['ann'])} vs FD {_pct(x['fd_ann'])}, "
-             f"{fmt_inr(abs(x['benefit']))} left on the table ({x['n']} lots)." for ft, slab, x, v in worst]
-    if bullets or flags:
-        html = '<div class="iv-box info"><b>What your own history suggests</b><ul>' + \
-               "".join(f"<li>{b}</li>" for b in bullets) + "</ul>"
-        if flags:
-            html += '<b style="display:block;margin-top:10px;">Biggest missed opportunities</b><ul>' + \
-                    "".join(f"<li>{f}</li>" for f in flags) + "</ul>"
-        html += ('<div style="margin-top:8px;font-size:12px;opacity:.8;">Pre-tax and based on past redemptions — '
-                 'not a forecast. Slabs with fewer than 3 lots are not used for guidance.</div></div>')
-        st.markdown(html, unsafe_allow_html=True)
 
     # ── lot-wise detail ──────────────────────────────────────────────────────
     with st.expander("Lot-wise detail and export", expanded=False):
@@ -313,7 +431,7 @@ def render_investment_overview(entity=None, as_of=None):
 
 def _setup_panel():
     with st.expander("⚙️ Capital gain data & setup (sheet upload, open holdings, FD rates)", expanded=False):
-        t1, t2, t3 = st.tabs(["Capital gain sheet", "Open holdings", "FD rate card"])
+        t1, t2, t3, t4 = st.tabs(["Capital gain sheet", "Open holdings", "FD rate card", "FD terms"])
 
         with t1:
             st.caption("One-time load of the historical capital-gain workbook (CKVPL = Ventures, CKSPL = Stores). "
@@ -402,3 +520,58 @@ def _setup_panel():
                 st.cache_data.clear()
                 st.success("FD rates saved.")
                 st.rerun()
+
+        with t4:
+            st.caption("Rate, start and maturity of each fixed deposit, used to compute the interest actually earned "
+                       "(quarterly compounding). One row per term: when an FD is renewed, add a new row with the new "
+                       "rate and dates. End = maturity (or redemption, if earlier).")
+            terms = get_fd_terms()
+            if terms:
+                st.success(f"{len(terms)} FD terms loaded.")
+            st.download_button("⬇️ Download FD terms workbook (current terms, upload-ready)",
+                               build_fd_terms_workbook(), file_name="FD_Terms_Upload.xlsx",
+                               mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                               key="dl_fd_terms")
+            up3 = st.file_uploader("FD terms workbook (.xlsx) \u2014 the downloaded format, or the old FD tracker", type=["xlsx"],
+                                   key="fd_terms_up")
+            if up3 is not None and st.button("📥 Load FD terms from workbook", key="fd_terms_btn"):
+                with tempfile.NamedTemporaryFile(delete=False, suffix=".xlsx") as tmp:
+                    tmp.write(up3.getvalue())
+                    path = tmp.name
+                res = import_fd_terms(path)
+                try:
+                    os.unlink(path)
+                except OSError:
+                    pass
+                if res["errors"] and not res["loaded"]:
+                    st.error("; ".join(res["errors"]))
+                else:
+                    st.success(f"Loaded {res['loaded']}; skipped {res['skipped']} incomplete rows.")
+                    st.cache_data.clear()
+                    st.rerun()
+            if terms:
+                tdf = pd.DataFrame(terms)[["entity", "bank", "account_no", "principal", "rate", "start_date",
+                                           "end_date", "status", "source"]]
+                tdf["start_date"] = pd.to_datetime(tdf["start_date"]).dt.date
+                tdf["end_date"] = pd.to_datetime(tdf["end_date"]).dt.date
+                ed = st.data_editor(
+                    tdf, num_rows="dynamic", hide_index=True, use_container_width=True, key="fd_terms_editor",
+                    column_config={"entity": st.column_config.SelectboxColumn("Entity", options=["Stores", "Ventures"]),
+                                   "rate": st.column_config.NumberColumn("Rate % p.a.", format="%.2f"),
+                                   "principal": st.column_config.NumberColumn("Principal", format="%.2f"),
+                                   "start_date": st.column_config.DateColumn("Start"),
+                                   "end_date": st.column_config.DateColumn("End")})
+                if st.button("💾 Save FD terms", key="fd_terms_save"):
+                    rows = []
+                    for _, r in ed.iterrows():
+                        if pd.isna(r["principal"]) or pd.isna(r["start_date"]):
+                            continue
+                        rows.append(dict(entity=r["entity"], bank=r["bank"], account_no=r["account_no"],
+                                         principal=r["principal"], rate=r["rate"], start_date=str(r["start_date"]),
+                                         end_date=(None if pd.isna(r["end_date"]) else str(r["end_date"])),
+                                         status=r["status"] if isinstance(r["status"], str) else "",
+                                         source=r["source"] if isinstance(r["source"], str) else "Manual"))
+                    save_fd_terms(rows)
+                    st.cache_data.clear()
+                    st.success("FD terms saved.")
+                    st.rerun()

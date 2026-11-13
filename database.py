@@ -1772,11 +1772,12 @@ def get_investment_events(entity=None):
 
     events = []
     for r in conn.execute(
-            f"SELECT scheme_name, scheme_type, entity, opening_value "
+            f"SELECT scheme_name, scheme_type, entity, opening_value, opening_date "
             f"FROM investment_register WHERE 1=1{ent_sql}", ent_p).fetchall():
         events.append({"date": None, "scheme_name": r["scheme_name"],
                        "scheme_type": r["scheme_type"], "entity": r["entity"],
-                       "delta": r["opening_value"] or 0, "source": "Opening"})
+                       "delta": r["opening_value"] or 0, "source": "Opening",
+                       "opening_date": r["opening_date"]})
 
     for r in conn.execute(f"""
         SELECT t.date, t.entity, t.debit, t.credit,
@@ -3143,3 +3144,233 @@ def get_capital_gain_lots(entity=None):
 
 if __name__ == "__main__":
     init_db()
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# FD terms — rate, start and maturity of each fixed deposit (from the FD tracker sheet)
+# ══════════════════════════════════════════════════════════════════════════════
+def _ensure_fd_terms(conn):
+    conn.execute("""CREATE TABLE IF NOT EXISTS fd_terms (
+        id INTEGER PRIMARY KEY AUTOINCREMENT, entity TEXT, bank TEXT, account_no TEXT,
+        principal REAL, rate REAL, start_date TEXT, end_date TEXT, status TEXT, source TEXT DEFAULT 'Manual')""")
+
+
+def _fd_bank(*texts, account=""):
+    for t in texts:
+        t = (t or "").lower() if isinstance(t, str) else ""
+        if "hdfc" in t:
+            return "HDFC"
+        if "axis" in t:
+            return "Axis"
+    a = str(account)
+    if a.startswith(("5030", "1670")):
+        return "HDFC"
+    if a.startswith("92"):
+        return "Axis"
+    return "Other"
+
+
+def get_fd_terms():
+    conn = get_connection()
+    _ensure_fd_terms(conn)
+    rows = conn.execute("SELECT * FROM fd_terms ORDER BY entity, account_no, start_date").fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+def save_fd_terms(rows):
+    """Replace ALL fd_terms with `rows` (dicts: entity, bank, account_no, principal, rate, start_date, end_date, status)."""
+    conn = get_connection()
+    _ensure_fd_terms(conn)
+    conn.execute("DELETE FROM fd_terms")
+    for r in rows:
+        if not r.get("start_date") or not r.get("principal"):
+            continue
+        conn.execute(
+            "INSERT INTO fd_terms (entity, bank, account_no, principal, rate, start_date, end_date, status, source) "
+            "VALUES (?,?,?,?,?,?,?,?,?)",
+            [r.get("entity"), r.get("bank"), str(r.get("account_no") or ""), float(r["principal"]),
+             float(r.get("rate") or 0), str(r["start_date"])[:10], (str(r["end_date"])[:10] if r.get("end_date") else None),
+             r.get("status") or "", r.get("source") or "Manual"])
+    conn.commit()
+    conn.close()
+
+
+def import_fd_terms(path):
+    """
+    Load the FD tracker workbook (sheets 'STORES' and 'ventures'): one row per FD term with
+    principal, rate, deposit start, maturity and (if earlier) redemption date. Replaces earlier
+    sheet-loaded rows; rows added by hand are kept.
+    """
+    import openpyxl
+    import datetime as _dt
+    res = {"loaded": {}, "skipped": 0, "errors": []}
+    try:
+        wb = openpyxl.load_workbook(path, data_only=True)
+    except Exception as exc:
+        res["errors"].append(f"Cannot open workbook: {exc}")
+        return res
+    flat = _import_fd_terms_flat(wb, res)
+    if flat is not None:
+        return flat
+
+    def _d(x):
+        if isinstance(x, _dt.datetime):
+            return x.date().isoformat()
+        if isinstance(x, _dt.date):
+            return x.isoformat()
+        return None
+
+    out = []
+    for ws in wb.worksheets:
+        name = ws.title.strip().lower()
+        entity = "Stores" if "store" in name else ("Ventures" if "ventur" in name else None)
+        if not entity:
+            continue
+        hdr = None
+        for r in range(1, 12):
+            vals = {str(ws.cell(r, c).value or "").strip().lower(): c for c in range(1, 15)}
+            if "principal amount." in vals or "principal amount" in vals:
+                hdr = (r, vals)
+                break
+        if not hdr:
+            res["errors"].append(f"Sheet '{ws.title}': header row not found")
+            continue
+        hr, cols = hdr
+        g = lambda *names: next((cols[n] for n in names if n in cols), None)
+        c_acc, c_st, c_p = g("account no."), g("status(active/redeem/opening)"), g("principal amount.", "principal amount")
+        c_rate, c_rev = g("rate of interest"), g("revised int rate")
+        c_start, c_mat = g("deposit start date"), g("maturity date")
+        c_red = g("date of redemption")
+        n = 0
+        for r in range(hr + 1, ws.max_row + 1):
+            acc, p = ws.cell(r, c_acc).value, ws.cell(r, c_p).value
+            start, mat = _d(ws.cell(r, c_start).value), _d(ws.cell(r, c_mat).value)
+            red = _d(ws.cell(r, c_red).value) if c_red else None
+            rate = ws.cell(r, c_rev).value if c_rev and isinstance(ws.cell(r, c_rev).value, (int, float)) else ws.cell(r, c_rate).value
+            if not acc or not isinstance(p, (int, float)) or not start or not isinstance(rate, (int, float)):
+                res["skipped"] += 1
+                continue
+            end = min(x for x in (mat, red) if x) if (mat or red) else None
+            acc_s = str(acc).split("(")[0].strip()
+            bank = _fd_bank(ws.cell(r, 1).value, ws.cell(r, c_st).value, account=acc_s)
+            out.append(dict(entity=entity, bank=bank, account_no=acc_s, principal=p, rate=rate,
+                            start_date=start, end_date=end, status=str(ws.cell(r, c_st).value or ""), source="Sheet"))
+            n += 1
+        res["loaded"][entity] = n
+    if not out:
+        res["errors"].append("No FD rows found.")
+        return res
+    keep = [t for t in get_fd_terms() if t.get("source") != "Sheet"]
+    save_fd_terms(keep + out)
+    return res
+
+
+def compute_fd_earnings(entity=None, win_start=None, win_end=None):
+    """
+    Interest earned by each FD term inside [win_start, win_end] (ISO dates), quarterly compounding:
+        value(d) = principal * (1 + rate/4) ** (4 * d / 365),  d = days since deposit start
+    interest in window = value(end) - value(start) for the part of the term inside the window.
+    Terms stop at maturity/redemption — after that the money is renewed on terms not yet recorded.
+    Returns a list of dicts: entity, bank, account_no, principal, rate, start, end, days, interest, cap_days, matured.
+    """
+    import datetime as _dt
+    iso = _dt.date.fromisoformat
+    win_end_d = iso(win_end) if win_end else _dt.date.today()
+    win_start_d = iso(win_start) if win_start else None
+    out = []
+    for t in get_fd_terms():
+        if entity and t["entity"] != entity:
+            continue
+        s = iso(t["start_date"])
+        term_end = iso(t["end_date"]) if t.get("end_date") else win_end_d
+        lo = max(s, win_start_d) if win_start_d else s
+        hi = min(term_end, win_end_d)
+        if hi <= lo:
+            continue
+        f = lambda d: t["principal"] * (1 + t["rate"] / 400.0) ** (4 * (d - s).days / 365.0)
+        days = (hi - lo).days
+        out.append(dict(entity=t["entity"], bank=t["bank"], account_no=t["account_no"], principal=t["principal"],
+                        rate=t["rate"], start=t["start_date"], end=str(term_end), days=days,
+                        interest=f(hi) - f(lo), cap_days=t["principal"] * days,
+                        matured=term_end < win_end_d and t.get("status", "").lower() != "redeemed"))
+    return out
+
+
+FD_TERMS_COLUMNS = ["Entity", "Bank", "Account No", "Principal", "Rate % p.a.", "Start Date", "End Date", "Status"]
+
+
+def _import_fd_terms_flat(wb, res):
+    """
+    Simple one-sheet format (see FD_TERMS_COLUMNS), one row per FD term. Returns the result dict
+    when the workbook is in this format, or None so the caller falls back to the tracker layout.
+    """
+    import datetime as _dt
+    ws = next((w for w in wb.worksheets if w.title.strip().lower() in ("fd terms", "fd_terms")), None)
+    if ws is None:
+        return None
+    head = [str(ws.cell(1, c).value or "").strip().lower() for c in range(1, 12)]
+    need = [h.lower() for h in FD_TERMS_COLUMNS]
+    if not all(n in head for n in need):
+        res["errors"].append("Sheet 'FD terms': expected columns " + ", ".join(FD_TERMS_COLUMNS))
+        return res
+    ix = {n: head.index(n) + 1 for n in need}
+
+    def _d(x):
+        if isinstance(x, _dt.datetime):
+            return x.date().isoformat()
+        if isinstance(x, _dt.date):
+            return x.isoformat()
+        if isinstance(x, str) and x.strip():
+            try:
+                return _dt.date.fromisoformat(x.strip()[:10]).isoformat()
+            except ValueError:
+                return None
+        return None
+
+    out = []
+    for r in range(2, ws.max_row + 1):
+        g = lambda n: ws.cell(r, ix[n.lower()]).value
+        ent, acc, p, rate = g("Entity"), g("Account No"), g("Principal"), g("Rate % p.a.")
+        start, end = _d(g("Start Date")), _d(g("End Date"))
+        if not ent or not acc or not isinstance(p, (int, float)) or not isinstance(rate, (int, float)) or not start:
+            if any(ws.cell(r, c).value for c in range(1, 9)):
+                res["skipped"] += 1
+            continue
+        ent = "Stores" if str(ent).strip().lower().startswith("store") else "Ventures"
+        acc_s = str(acc).split("(")[0].strip()
+        bank = g("Bank") or _fd_bank(account=acc_s)
+        out.append(dict(entity=ent, bank=str(bank).strip(), account_no=acc_s, principal=float(p), rate=float(rate),
+                        start_date=start, end_date=end, status=str(g("Status") or ""), source="Sheet"))
+        res["loaded"][ent] = res["loaded"].get(ent, 0) + 1
+    if not out:
+        res["errors"].append("No FD rows found in sheet 'FD terms'.")
+        return res
+    keep = [t for t in get_fd_terms() if t.get("source") != "Sheet"]
+    save_fd_terms(keep + out)
+    return res
+
+
+def build_fd_terms_workbook(terms=None):
+    """Bytes of an .xlsx in the flat FD-terms format, pre-filled with the current terms (or empty)."""
+    import io
+    import pandas as _pd
+    terms = get_fd_terms() if terms is None else terms
+    rows = [[t["entity"], t["bank"], t["account_no"], t["principal"], t["rate"], t["start_date"],
+             t["end_date"], t["status"]] for t in terms]
+    df = _pd.DataFrame(rows, columns=FD_TERMS_COLUMNS)
+    note = _pd.DataFrame({"Notes": [
+        "One row per FD term. When an FD is renewed, add a NEW row with the new rate and dates.",
+        "Entity: Stores or Ventures.  Bank: HDFC / Axis / ...",
+        "Principal: amount invested for that term.  Rate: annual % (quarterly compounding is applied).",
+        "Start Date / End Date: yyyy-mm-dd. End = maturity date (or redemption date if closed earlier).",
+        "Status: free text (e.g. Active, Redeemed, Auto renewed).",
+        "Upload in Investments > Setup > FD terms. Loading replaces the previously loaded sheet rows."]})
+    buf = io.BytesIO()
+    with _pd.ExcelWriter(buf, engine="openpyxl") as xw:
+        df.to_excel(xw, sheet_name="FD terms", index=False)
+        note.to_excel(xw, sheet_name="Instructions", index=False)
+        ws = xw.sheets["FD terms"]
+        for col, w in zip("ABCDEFGH", (12, 10, 20, 16, 13, 13, 13, 22)):
+            ws.column_dimensions[col].width = w
+    return buf.getvalue()
